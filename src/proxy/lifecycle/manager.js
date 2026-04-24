@@ -43,8 +43,6 @@ class LifecycleManager {
     this._startedAt = null;
     this._consecutiveFailures = 0;
     this._reauthInProgress = false;
-    this._helloRateLimitUntil = 0;
-    this._reauthBackoffUntil = 0;
   }
 
   get nodeId() {
