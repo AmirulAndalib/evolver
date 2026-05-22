@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { copyHookScripts, removeHookScripts } = require('./hookAdapter');
+const { copyHookScripts, removeHookScripts, removeMarkedSection, assertSafeConfigDir } = require('./hookAdapter');
 
 const HOOK_SCRIPTS_DIR_NAME = 'hooks';
 const PLUGINS_DIR_NAME = 'plugins';
@@ -124,6 +124,7 @@ function install({ configRoot, evolverRoot, force }) {
   const pluginsDir = path.join(opencodeDir, PLUGINS_DIR_NAME);
   const pluginPath = path.join(pluginsDir, PLUGIN_FILE_NAME);
   const agentsMdPath = path.join(configRoot, 'AGENTS.md');
+  assertSafeConfigDir(opencodeDir, '.opencode', { subdirs: [HOOK_SCRIPTS_DIR_NAME, PLUGINS_DIR_NAME] });
 
   if (!force && isEvolverManagedPluginFile(pluginPath)) {
     console.log('[opencode] Evolver plugin already installed. Use --force to overwrite.');
@@ -292,6 +293,7 @@ function uninstall({ configRoot }) {
   const pluginsDir = path.join(opencodeDir, PLUGINS_DIR_NAME);
   const pluginPath = path.join(pluginsDir, PLUGIN_FILE_NAME);
   const agentsMdPath = path.join(configRoot, 'AGENTS.md');
+  assertSafeConfigDir(opencodeDir, '.opencode', { subdirs: [HOOK_SCRIPTS_DIR_NAME, PLUGINS_DIR_NAME] });
 
   let changed = false;
 
@@ -302,19 +304,9 @@ function uninstall({ configRoot }) {
   const scripts = removeHookScripts(hooksDir);
   if (scripts > 0) changed = true;
 
-  try {
-    if (fs.existsSync(agentsMdPath)) {
-      let content = fs.readFileSync(agentsMdPath, 'utf8');
-      if (content.includes(EVOLVER_MARKER)) {
-        const idx = content.indexOf(EVOLVER_MARKER);
-        const nextSection = content.indexOf('\n## ', idx + EVOLVER_MARKER.length);
-        const endIdx = nextSection !== -1 ? nextSection : content.length;
-        content = content.slice(0, idx).trimEnd() + (nextSection !== -1 ? content.slice(endIdx) : '');
-        fs.writeFileSync(agentsMdPath, content.trimEnd() + '\n', 'utf8');
-        changed = true;
-      }
-    }
-  } catch { /* ignore */ }
+  if (removeMarkedSection(agentsMdPath, EVOLVER_MARKER)) {
+    changed = true;
+  }
 
   console.log(changed
     ? '[opencode] Uninstalled evolver plugin and hooks.'

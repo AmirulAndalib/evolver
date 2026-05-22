@@ -41,6 +41,7 @@ describe('validator daemon', function () {
     process.env.A2A_HUB_URL = 'http://hub.local';
     process.env.HUB_NODE_SECRET = 'secret';
     process.env.A2A_NODE_ID = 'node_test_daemon';
+    process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
     // Tight intervals so tests run fast
     process.env.EVOLVER_VALIDATOR_DAEMON_INTERVAL_MS = '20000';
     process.env.EVOLVER_VALIDATOR_DAEMON_FIRST_DELAY_MS = '0';

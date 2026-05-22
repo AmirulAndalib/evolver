@@ -48,10 +48,16 @@ describe('stakeBootstrap retry state machine', function () {
   let tmpHome;
   let prevHome;
 
+  let prevInsecure;
   beforeEach(() => {
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'evolver-stake-test-'));
     prevHome = process.env.EVOLVER_HOME;
+    prevInsecure = process.env.EVOMAP_HUB_ALLOW_INSECURE;
     process.env.EVOLVER_HOME = tmpHome;
+    // stakeBootstrap routes via hubFetch; tests stub global.fetch and use
+    // a fake https hubUrl. Insecure mode makes hubFetch route through
+    // global.fetch so the stubs apply.
+    process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
     restoreA2a = installA2aProtocolStub('node-test-stake', 'https://hub.example.com');
   });
 
@@ -62,6 +68,8 @@ describe('stakeBootstrap retry state machine', function () {
     restoreA2a = null;
     if (prevHome === undefined) delete process.env.EVOLVER_HOME;
     else process.env.EVOLVER_HOME = prevHome;
+    if (prevInsecure === undefined) delete process.env.EVOMAP_HUB_ALLOW_INSECURE;
+    else process.env.EVOMAP_HUB_ALLOW_INSECURE = prevInsecure;
     try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch (_) {}
   });
 

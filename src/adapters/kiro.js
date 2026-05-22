@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { copyHookScripts, removeHookScripts } = require('./hookAdapter');
+const { copyHookScripts, removeHookScripts, removeMarkedSection, assertSafeConfigDir } = require('./hookAdapter');
 
 const HOOK_SCRIPTS_DIR_NAME = 'hooks';
 const EVOLVER_MARKER = '<!-- evolver-evolution-memory -->';
@@ -110,6 +110,7 @@ function install({ configRoot, evolverRoot, force }) {
   const hooksDir = path.join(kiroDir, HOOK_SCRIPTS_DIR_NAME);
   const agentsMdPath = path.join(configRoot, 'AGENTS.md');
   const scriptsBase = '.kiro/hooks';
+  assertSafeConfigDir(kiroDir, '.kiro', { subdirs: [HOOK_SCRIPTS_DIR_NAME] });
 
   const hookPaths = Object.values(HOOK_FILES).map(name => path.join(hooksDir, name));
 
@@ -153,6 +154,7 @@ function uninstall({ configRoot }) {
   const kiroDir = path.join(configRoot, '.kiro');
   const hooksDir = path.join(kiroDir, HOOK_SCRIPTS_DIR_NAME);
   const agentsMdPath = path.join(configRoot, 'AGENTS.md');
+  assertSafeConfigDir(kiroDir, '.kiro', { subdirs: [HOOK_SCRIPTS_DIR_NAME] });
 
   let changed = false;
   let removedCount = 0;
@@ -173,19 +175,9 @@ function uninstall({ configRoot }) {
   const scripts = removeHookScripts(hooksDir);
   if (scripts > 0) changed = true;
 
-  try {
-    if (fs.existsSync(agentsMdPath)) {
-      let content = fs.readFileSync(agentsMdPath, 'utf8');
-      if (content.includes(EVOLVER_MARKER)) {
-        const idx = content.indexOf(EVOLVER_MARKER);
-        const nextSection = content.indexOf('\n## ', idx + EVOLVER_MARKER.length);
-        const endIdx = nextSection !== -1 ? nextSection : content.length;
-        content = content.slice(0, idx).trimEnd() + (nextSection !== -1 ? content.slice(endIdx) : '');
-        fs.writeFileSync(agentsMdPath, content.trimEnd() + '\n', 'utf8');
-        changed = true;
-      }
-    }
-  } catch { /* ignore */ }
+  if (removeMarkedSection(agentsMdPath, EVOLVER_MARKER)) {
+    changed = true;
+  }
 
   console.log(changed
     ? `[kiro] Uninstalled evolver hooks (${removedCount} hook files + ${scripts} scripts removed).`

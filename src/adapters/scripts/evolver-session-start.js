@@ -7,37 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-function findEvolverRoot() {
-  const candidates = [
-    process.env.EVOLVER_ROOT,
-    path.resolve(__dirname, '..', '..', '..'),
-  ];
-  for (const c of candidates) {
-    if (c && fs.existsSync(path.join(c, 'package.json'))) {
-      try {
-        const pkg = JSON.parse(fs.readFileSync(path.join(c, 'package.json'), 'utf8'));
-        if (pkg.name === '@evomap/evolver' || pkg.name === 'evolver') return c;
-      } catch { /* skip */ }
-    }
-  }
-  const homeSkills = path.join(require('os').homedir(), 'skills', 'evolver');
-  if (fs.existsSync(path.join(homeSkills, 'package.json'))) return homeSkills;
-  return null;
-}
-
-function findMemoryGraph(evolverRoot) {
-  if (process.env.MEMORY_GRAPH_PATH && fs.existsSync(process.env.MEMORY_GRAPH_PATH)) {
-    return process.env.MEMORY_GRAPH_PATH;
-  }
-  const candidates = [
-    evolverRoot && path.join(evolverRoot, 'memory', 'evolution', 'memory_graph.jsonl'),
-    evolverRoot && path.join(evolverRoot, 'MEMORY', 'evolution', 'memory_graph.jsonl'),
-  ];
-  for (const c of candidates) {
-    if (c && fs.existsSync(c)) return c;
-  }
-  return null;
-}
+const { findEvolverRoot, findMemoryGraph } = require('./_runtimePaths');
 
 function readLastN(filePath, n) {
   try {

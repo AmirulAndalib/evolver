@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { mergeJsonFile, copyHookScripts, appendSectionToFile, removeHookScripts } = require('./hookAdapter');
+const { mergeJsonFile, copyHookScripts, appendSectionToFile, removeHookScripts, removeMarkedSection, assertSafeConfigDir } = require('./hookAdapter');
 
 const HOOK_SCRIPTS_DIR_NAME = 'hooks';
 const EVOLVER_MARKER = '<!-- evolver-evolution-memory -->';
@@ -65,6 +65,7 @@ function install({ configRoot, evolverRoot, force }) {
   const settingsPath = path.join(claudeDir, 'settings.json');
   const hooksDir = path.join(claudeDir, HOOK_SCRIPTS_DIR_NAME);
   const claudeMdPath = path.join(configRoot, 'CLAUDE.md');
+  assertSafeConfigDir(claudeDir, '.claude', { subdirs: [HOOK_SCRIPTS_DIR_NAME] });
 
   if (!force && fs.existsSync(settingsPath)) {
     try {
@@ -104,54 +105,66 @@ function uninstall({ configRoot }) {
   const settingsPath = path.join(claudeDir, 'settings.json');
   const hooksDir = path.join(claudeDir, HOOK_SCRIPTS_DIR_NAME);
   const claudeMdPath = path.join(configRoot, 'CLAUDE.md');
+  assertSafeConfigDir(claudeDir, '.claude', { subdirs: [HOOK_SCRIPTS_DIR_NAME] });
 
   let changed = false;
 
+  // Strip evolver entries from settings.json. Even without the marker we
+  // still try to filter by command — a missing/dropped marker should not
+  // strand obvious evolver-owned entries (#538).
   try {
     if (fs.existsSync(settingsPath)) {
       const data = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-      if (data._evolver_managed) {
-        if (data.hooks) {
-          for (const event of Object.keys(data.hooks)) {
-            if (Array.isArray(data.hooks[event])) {
-              data.hooks[event] = data.hooks[event]
-                .map(matcher => {
-                  if (!matcher || !Array.isArray(matcher.hooks)) return matcher;
-                  const filtered = matcher.hooks.filter(h => {
-                    const cmd = (h && h.command) || '';
-                    return !cmd.includes('evolver-session') && !cmd.includes('evolver-signal');
-                  });
-                  return { ...matcher, hooks: filtered };
-                })
-                .filter(matcher => matcher && Array.isArray(matcher.hooks) && matcher.hooks.length > 0);
-              if (data.hooks[event].length === 0) delete data.hooks[event];
-            }
+      let touched = false;
+      if (data.hooks) {
+        for (const event of Object.keys(data.hooks)) {
+          if (Array.isArray(data.hooks[event])) {
+            const beforeLen = data.hooks[event].length;
+            data.hooks[event] = data.hooks[event]
+              .map(matcher => {
+                if (!matcher || !Array.isArray(matcher.hooks)) return matcher;
+                const innerBefore = matcher.hooks.length;
+                const filtered = matcher.hooks.filter(h => {
+                  const cmd = (h && h.command) || '';
+                  return !cmd.includes('evolver-session') && !cmd.includes('evolver-signal');
+                });
+                // A matcher containing both evolver and user hooks shrinks
+                // its inner array without changing the outer matcher count.
+                // Track the inner-array shrink so `touched` reflects it.
+                if (filtered.length !== innerBefore) touched = true;
+                return { ...matcher, hooks: filtered };
+              })
+              .filter(matcher => matcher && Array.isArray(matcher.hooks) && matcher.hooks.length > 0);
+            if (data.hooks[event].length !== beforeLen) touched = true;
+            if (data.hooks[event].length === 0) delete data.hooks[event];
           }
-          if (Object.keys(data.hooks).length === 0) delete data.hooks;
         }
+        if (Object.keys(data.hooks).length === 0) delete data.hooks;
+      }
+      if (data._evolver_managed) {
         delete data._evolver_managed;
+        touched = true;
+      }
+      if (touched) {
         fs.writeFileSync(settingsPath, JSON.stringify(data, null, 2) + '\n', 'utf8');
         changed = true;
       }
     }
-  } catch { /* ignore */ }
+  } catch (e) {
+    console.warn(`[claude-code] Failed to clean ${settingsPath}: ${e.message || e}`);
+  }
 
   const scripts = removeHookScripts(hooksDir);
   if (scripts > 0) changed = true;
-
   try {
-    if (fs.existsSync(claudeMdPath)) {
-      let content = fs.readFileSync(claudeMdPath, 'utf8');
-      if (content.includes(EVOLVER_MARKER)) {
-        const idx = content.indexOf(EVOLVER_MARKER);
-        const nextSection = content.indexOf('\n## ', idx + EVOLVER_MARKER.length);
-        const endIdx = nextSection !== -1 ? nextSection : content.length;
-        content = content.slice(0, idx).trimEnd() + (nextSection !== -1 ? content.slice(endIdx) : '');
-        fs.writeFileSync(claudeMdPath, content.trimEnd() + '\n', 'utf8');
-        changed = true;
-      }
+    if (fs.existsSync(hooksDir) && fs.readdirSync(hooksDir).length === 0) {
+      fs.rmdirSync(hooksDir);
     }
-  } catch { /* ignore */ }
+  } catch { /* best-effort */ }
+
+  if (removeMarkedSection(claudeMdPath, EVOLVER_MARKER)) {
+    changed = true;
+  }
 
   console.log(changed
     ? '[claude-code] Uninstalled evolver hooks.'

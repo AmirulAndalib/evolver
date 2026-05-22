@@ -5,75 +5,51 @@
 // Input: stdin JSON. Output: stdout JSON with followup_message.
 
 const fs = require('fs');
-const path = require('path');
-const { execSync, spawnSync } = require('child_process');
+const { spawnSync } = require('child_process');
 // 10 MB — prevents RangeError on large child process output (e.g. git log/diff
 // on large repos). See GHSA reports / issue #451.
 const MAX_EXEC_BUFFER = 10 * 1024 * 1024;
 
+const { findEvolverRoot, findMemoryGraph } = require('./_runtimePaths');
 
-function findEvolverRoot() {
-  const candidates = [
-    process.env.EVOLVER_ROOT,
-    path.resolve(__dirname, '..', '..', '..'),
-  ];
-  for (const c of candidates) {
-    if (c && fs.existsSync(path.join(c, 'package.json'))) {
-      try {
-        const pkg = JSON.parse(fs.readFileSync(path.join(c, 'package.json'), 'utf8'));
-        if (pkg.name === '@evomap/evolver' || pkg.name === 'evolver') return c;
-      } catch { /* skip */ }
-    }
+function runGit(args, cwd) {
+  // Argv-array form, no shell. Avoids POSIX `2>/dev/null` redirects that
+  // break on Windows cmd.exe (#537). Failures (e.g. no HEAD~1 in a fresh
+  // repo) are surfaced as a non-zero status; callers distinguish them
+  // from successful empty output via the `ok` flag (PR #94 round-6 LOW).
+  const res = spawnSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    timeout: 5000,
+    maxBuffer: MAX_EXEC_BUFFER,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    shell: false,
+  });
+  if (res.status === 0 && typeof res.stdout === 'string') {
+    return { ok: true, out: res.stdout.trim() };
   }
-  const homeSkills = path.join(require('os').homedir(), 'skills', 'evolver');
-  if (fs.existsSync(path.join(homeSkills, 'package.json'))) return homeSkills;
-  return null;
-}
-
-function findMemoryGraph(evolverRoot) {
-  if (process.env.MEMORY_GRAPH_PATH && fs.existsSync(process.env.MEMORY_GRAPH_PATH)) {
-    return process.env.MEMORY_GRAPH_PATH;
-  }
-  const candidates = [
-    evolverRoot && path.join(evolverRoot, 'memory', 'evolution', 'memory_graph.jsonl'),
-    evolverRoot && path.join(evolverRoot, 'MEMORY', 'evolution', 'memory_graph.jsonl'),
-  ];
-  for (const c of candidates) {
-    if (c && fs.existsSync(c)) return c;
-  }
-  if (evolverRoot) {
-    const defaultPath = path.join(evolverRoot, 'memory', 'evolution', 'memory_graph.jsonl');
-    fs.mkdirSync(path.dirname(defaultPath), { recursive: true });
-    return defaultPath;
-  }
-  return null;
+  return { ok: false, out: '' };
 }
 
 function getGitDiffStats() {
-  try {
-    const cwd = process.cwd();
-    const stat = execSync('git diff --stat HEAD~1 2>/dev/null || git diff --stat 2>/dev/null || echo ""', {
-      cwd,
-      encoding: 'utf8',
-      timeout: 5000, maxBuffer: MAX_EXEC_BUFFER
-    }).trim();
-    const diffContent = execSync('git diff HEAD~1 --no-color 2>/dev/null || git diff --no-color 2>/dev/null || echo ""', {
-      cwd,
-      encoding: 'utf8',
-      timeout: 5000, maxBuffer: MAX_EXEC_BUFFER
-    }).trim();
-    const filesChanged = (stat.match(/\d+ files? changed/) || ['0'])[0];
-    const insertions = (stat.match(/(\d+) insertions?/) || [null, '0'])[1];
-    const deletions = (stat.match(/(\d+) deletions?/) || [null, '0'])[1];
-    return {
-      stat,
-      summary: `${filesChanged}, +${insertions}/-${deletions}`,
-      diffSnippet: diffContent.slice(0, 2000),
-      hasChanges: stat.length > 0,
-    };
-  } catch {
-    return { stat: '', summary: 'unknown', diffSnippet: '', hasChanges: false };
-  }
+  const cwd = process.cwd();
+  // Distinguish "git failed (no HEAD~1, etc.)" from "git succeeded with
+  // empty output (e.g. empty merge)". The previous `||` chain treated
+  // both as falsy and fell through to the working-tree diff, which can
+  // surface unrelated unstaged changes as the session outcome.
+  const statHead1 = runGit(['diff', '--stat', 'HEAD~1'], cwd);
+  const stat = statHead1.ok ? statHead1.out : runGit(['diff', '--stat'], cwd).out;
+  const diffHead1 = runGit(['diff', '--no-color', 'HEAD~1'], cwd);
+  const diffContent = diffHead1.ok ? diffHead1.out : runGit(['diff', '--no-color'], cwd).out;
+  const filesChanged = (stat.match(/\d+ files? changed/) || ['0'])[0];
+  const insertions = (stat.match(/(\d+) insertions?/) || [null, '0'])[1];
+  const deletions = (stat.match(/(\d+) deletions?/) || [null, '0'])[1];
+  return {
+    stat,
+    summary: `${filesChanged}, +${insertions}/-${deletions}`,
+    diffSnippet: diffContent.slice(0, 2000),
+    hasChanges: stat.length > 0,
+  };
 }
 
 function detectSignals(text) {

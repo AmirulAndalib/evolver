@@ -205,6 +205,7 @@ describe('validator.runValidatorCycle preflight gate', function () {
     process.env.A2A_HUB_URL = 'http://hub.local';
     process.env.HUB_NODE_SECRET = 'secret';
     process.env.A2A_NODE_ID = 'node_test_validator_pf';
+    process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
     try {
       const sb = require('../src/gep/validator/stakeBootstrap');
       if (sb && typeof sb._resetStateForTests === 'function') sb._resetStateForTests();

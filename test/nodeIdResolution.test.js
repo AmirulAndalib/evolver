@@ -2,11 +2,13 @@
 //   1. A2A_NODE_ID env (with format validation, warn on malformed but still use)
 //   2. Persisted ~/.evomap/node_id (accepts 12-32 hex)
 //   3. Project-local .evomap_node_id fallback
-//   4. Device fingerprint fallback (generates 12 hex)
+//   4. Random fallback (12 hex), persisted on first call
 //
 // Regression targets:
 //   - NODE_ID_RE must accept 16-hex hub-issued IDs (was stuck at /{12}$/)
 //   - When persisted file has valid 16-hex ID, do NOT overwrite with fallback
+//   - Two installs with identical device fingerprint must produce different
+//     IDs on first run (clone-collision fix, #71)
 const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
@@ -129,12 +131,11 @@ describe('getNodeId resolution', () => {
     });
   });
 
-  it('rejects obviously malformed persisted value and falls back to device fingerprint', () => {
+  it('rejects obviously malformed persisted value and falls back to a fresh random id', () => {
     withTempHome((tmpHome) => {
       const dir = path.join(tmpHome, '.evomap');
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       fs.writeFileSync(path.join(dir, 'node_id'), 'not-a-valid-id', 'utf8');
-      process.env.EVOMAP_DEVICE_ID = 'f'.repeat(32);
       const { getNodeId } = freshRequire('../src/gep/a2aProtocol');
       const id = getNodeId();
       assert.match(id, /^node_[a-f0-9]{12}$/, 'fallback should be 12-hex');
@@ -143,7 +144,6 @@ describe('getNodeId resolution', () => {
 
   it('fallback writes 12-hex node_id to ~/.evomap/node_id and is stable across repeated calls', () => {
     withTempHome((tmpHome) => {
-      process.env.EVOMAP_DEVICE_ID = 'a'.repeat(32);
       const mod1 = freshRequire('../src/gep/a2aProtocol');
       const first = mod1.getNodeId();
       assert.match(first, /^node_[a-f0-9]{12}$/);
@@ -155,5 +155,24 @@ describe('getNodeId resolution', () => {
       const mod2 = freshRequire('../src/gep/a2aProtocol');
       assert.equal(mod2.getNodeId(), first, 'second process should reuse persisted id');
     });
+  });
+
+  it('two installs with identical device fingerprint produce different node ids (clone-collision fix)', () => {
+    // Simulate: a container image is built and cloned to two hosts before
+    // evolver has ever run. Both hosts inherit the same hostname / MAC /
+    // agent name / cwd. The deterministic hash would have collided; the
+    // random fallback must not.
+    const ids = [];
+    for (let i = 0; i < 2; i++) {
+      withTempHome(() => {
+        process.env.EVOMAP_DEVICE_ID = 'a'.repeat(32);
+        process.env.AGENT_NAME = 'default';
+        const { getNodeId } = freshRequire('../src/gep/a2aProtocol');
+        ids.push(getNodeId());
+      });
+    }
+    assert.match(ids[0], /^node_[a-f0-9]{12}$/);
+    assert.match(ids[1], /^node_[a-f0-9]{12}$/);
+    assert.notEqual(ids[0], ids[1], 'identical fingerprint must not yield identical node id');
   });
 });

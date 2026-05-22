@@ -2,6 +2,7 @@
 
 const { PROXY_PROTOCOL_VERSION } = require('../mailbox/store');
 const { AuthError } = require('../lifecycle/manager');
+const { hubFetch } = require('../../gep/hubFetch');
 
 const MAX_BATCH = 50;
 const MAX_RETRIES = 10;
@@ -22,7 +23,7 @@ class OutboundSync {
 
     try {
       const senderId = this.store.getState('node_id');
-      const res = await fetch(endpoint, {
+      const res = await hubFetch(endpoint, {
         method: 'POST',
         headers: this.getHeaders(),
         body: JSON.stringify({

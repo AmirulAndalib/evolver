@@ -5,6 +5,7 @@ const os = require('os');
 const { MailboxStore } = require('./mailbox/store');
 const { ProxyHttpServer } = require('./server/http');
 const { buildRoutes } = require('./server/routes');
+const { buildMessagesHandler } = require('./router/messages_route');
 const { SyncEngine } = require('./sync/engine');
 const { LifecycleManager } = require('./lifecycle/manager');
 const { TaskMonitor } = require('./task/monitor');
@@ -21,6 +22,7 @@ class EvoMapProxy {
     this.port = opts.port;
     this.logger = opts.logger || console;
     this._skillPath = opts.skillPath || null;
+    this._anthropicBaseUrl = (opts.anthropicBaseUrl || process.env.EVOMAP_ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/+$/, '');
 
     this.store = null;
     this.server = null;
@@ -93,11 +95,17 @@ class EvoMapProxy {
       atpGet: (endpoint, query) => this._proxyHttp(endpoint, null, { method: 'GET', query }),
     };
 
+    const messagesHandler = buildMessagesHandler({
+      anthropicProxy: (reqPath, body, opts) => this._proxyAnthropic(reqPath, body, opts),
+      logger: this.logger,
+    });
+
     const routes = buildRoutes(this.store, proxyHandlers, this.taskMonitor, {
       dmHandler: this.dmHandler,
       skillUpdater: this.skillUpdater,
       sessionHandler: this.sessionHandler,
       getHubMailboxStatus: () => this._getHubMailboxStatus(),
+      messagesHandler,
     });
 
     const OUTBOUND_ROUTES = [
@@ -220,6 +228,67 @@ class EvoMapProxy {
     }
 
     return res.json();
+  }
+
+  // Phase C slice 4 + token mediation: relay to api.anthropic.com. The
+  // route layer applies router rewrite and decides stream vs. JSON; this
+  // method forwards the request and exposes the response shape.
+  //
+  // Allowed forward headers (lowercased): x-api-key, anthropic-version,
+  // and anything matching anthropic-* (anthropic-beta, etc.). Everything
+  // else (host, authorization, cookie, content-length, ...) is dropped
+  // so the inbound proxy-auth header never leaks upstream.
+  //
+  // Token mediation: the proxy server's `Authorization: Bearer <token>`
+  // header is consumed by ProxyHttpServer for self-auth and stripped
+  // here, so clients (e.g. Claude Code) can authenticate to the proxy
+  // with `ANTHROPIC_AUTH_TOKEN=<proxy_token>` without losing the ability
+  // to reach Anthropic upstream. When the client did not pass x-api-key,
+  // the proxy substitutes its own ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN
+  // env var on the upstream request. Env is read per-request so creds
+  // can be hot-swapped without restart, matching the EVOMAP_MODEL_*
+  // policy in README.
+  async _proxyAnthropic(reqPath, body, opts = {}) {
+    const baseUrl = (opts.baseUrl || this._anthropicBaseUrl || '').replace(/\/+$/, '');
+    const inbound = opts.inboundHeaders || {};
+    const timeoutMs = opts.timeoutMs || 60_000;
+
+    const fwd = { 'content-type': 'application/json' };
+    for (const [k, v] of Object.entries(inbound)) {
+      if (v === undefined || v === null) continue;
+      const lk = k.toLowerCase();
+      if (lk === 'x-api-key' || lk === 'anthropic-version' || lk.startsWith('anthropic-')) {
+        fwd[lk] = Array.isArray(v) ? v.join(', ') : String(v);
+      }
+    }
+
+    if (!fwd['x-api-key']) {
+      if (process.env.ANTHROPIC_API_KEY) {
+        fwd['x-api-key'] = process.env.ANTHROPIC_API_KEY;
+      } else if (process.env.ANTHROPIC_AUTH_TOKEN) {
+        fwd['authorization'] = `Bearer ${process.env.ANTHROPIC_AUTH_TOKEN}`;
+      }
+    }
+
+    const endpoint = `${baseUrl}${reqPath}`;
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: fwd,
+      body: JSON.stringify(body || {}),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    const headers = Object.fromEntries(res.headers.entries());
+    const contentType = (headers['content-type'] || '').toLowerCase();
+    const isStream = contentType.includes('text/event-stream');
+
+    return {
+      status: res.status,
+      headers,
+      stream: isStream ? res.body : null,
+      json: isStream ? null : () => res.json(),
+      text: () => res.text(),
+    };
   }
 
   async _getHubMailboxStatus() {

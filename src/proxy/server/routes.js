@@ -3,8 +3,8 @@
 const { PROXY_PROTOCOL_VERSION, SCHEMA_VERSION } = require('../mailbox/store');
 
 function buildRoutes(store, proxyHandlers, taskMonitor, extensions) {
-  const { dmHandler, skillUpdater, getHubMailboxStatus, sessionHandler } = extensions || {};
-  return {
+  const { dmHandler, skillUpdater, getHubMailboxStatus, sessionHandler, messagesHandler } = extensions || {};
+  const routes = {
     // -- Mailbox --
     'POST /mailbox/send': async ({ body }) => {
       if (!body.type) throw Object.assign(new Error('type is required'), { statusCode: 400 });
@@ -458,6 +458,16 @@ function buildRoutes(store, proxyHandlers, taskMonitor, extensions) {
       return { body: result };
     },
   };
+
+  // Phase C: only register /v1/messages when the proxy was built with a
+  // messages handler (i.e. _proxyAnthropic is available). Slice 5 wires it
+  // unconditionally so the route exists on every proxy startup; slice 6 adds
+  // EVOMAP_ROUTER_ENABLED behavior inside the handler.
+  if (messagesHandler) {
+    routes['POST /v1/messages'] = messagesHandler;
+  }
+
+  return routes;
 }
 
 module.exports = { buildRoutes };

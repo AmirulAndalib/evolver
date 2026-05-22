@@ -2,6 +2,7 @@
 
 const { PROXY_PROTOCOL_VERSION } = require('../mailbox/store');
 const { AuthError } = require('../lifecycle/manager');
+const { hubFetch } = require('../../gep/hubFetch');
 
 const DEFAULT_POLL_INTERVAL_ACTIVE = 10_000;
 const DEFAULT_POLL_INTERVAL_IDLE = 60_000;
@@ -22,7 +23,7 @@ class InboundSync {
 
     try {
       const senderId = this.store.getState('node_id');
-      const res = await fetch(endpoint, {
+      const res = await hubFetch(endpoint, {
         method: 'POST',
         headers: this.getHeaders(),
         body: JSON.stringify({ sender_id: senderId, proxy_protocol_version: PROXY_PROTOCOL_VERSION, cursor, limit }),
@@ -82,7 +83,7 @@ class InboundSync {
 
     try {
       const senderId = this.store.getState('node_id');
-      await fetch(endpoint, {
+      await hubFetch(endpoint, {
         method: 'POST',
         headers: this.getHeaders(),
         body: JSON.stringify({ sender_id: senderId, message_ids: delivered.map(m => m.id) }),

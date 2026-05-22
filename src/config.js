@@ -51,10 +51,29 @@ const HUB_SEARCH_TIMEOUT_MS = envInt('EVOLVER_HUB_SEARCH_TIMEOUT_MS', 8000);
 const PUBLIC_DEFAULT_HUB_URL = 'https://evomap.ai';
 
 function resolveHubUrl() {
-  return process.env.A2A_HUB_URL
+  const raw = process.env.A2A_HUB_URL
     || process.env.EVOMAP_HUB_URL
     || process.env.EVOLVER_DEFAULT_HUB_URL
     || PUBLIC_DEFAULT_HUB_URL;
+
+  if (process.env.EVOMAP_HUB_ALLOW_INSECURE !== '1') {
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      throw new Error(
+        '[config] Hub URL is not a valid URL: ' + JSON.stringify(raw) + '. ' +
+        'Set EVOMAP_HUB_ALLOW_INSECURE=1 to bypass (local dev / mock hub only).'
+      );
+    }
+    if (parsed.protocol !== 'https:') {
+      throw new Error(
+        '[config] Hub URL must use https:// — got ' + JSON.stringify(raw) + '. ' +
+        'Set EVOMAP_HUB_ALLOW_INSECURE=1 to bypass (local dev / mock hub only).'
+      );
+    }
+  }
+  return raw;
 }
 
 // --- Solidify & Validation ---

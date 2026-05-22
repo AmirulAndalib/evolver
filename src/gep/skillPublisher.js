@@ -1,6 +1,7 @@
 'use strict';
 
 var { getHubUrl, buildHubHeaders, getNodeId } = require('./a2aProtocol');
+var { hubFetch } = require('./hubFetch');
 
 /**
  * Sanitize a raw gene id into a human-readable kebab-case skill name.
@@ -282,7 +283,7 @@ function publishSkillToHub(gene, opts) {
 
   var endpoint = hubUrl.replace(/\/+$/, '') + '/a2a/skill/store/publish';
 
-  return fetch(endpoint, {
+  return hubFetch(endpoint, {
     method: 'POST',
     headers: buildHubHeaders(),
     body: JSON.stringify(body),
@@ -327,7 +328,7 @@ function updateSkillOnHub(nodeId, skillId, content, opts, gene) {
 
   var endpoint = hubUrl.replace(/\/+$/, '') + '/a2a/skill/store/update';
 
-  return fetch(endpoint, {
+  return hubFetch(endpoint, {
     method: 'PUT',
     headers: buildHubHeaders(),
     body: JSON.stringify(body),

@@ -187,8 +187,14 @@ function getLastSignals(statePath) {
 }
 
 // Singleton Guard - prevent multiple evolver daemon instances
+function getLockFilePath() {
+  // Allow tests / sandboxed runs to override the pid-file location so they
+  // do not collide with a real daemon's lock at the source-dir default.
+  const dir = process.env.EVOLVER_LOCK_DIR || __dirname;
+  return path.join(dir, 'evolver.pid');
+}
 function acquireLock() {
-  const lockFile = path.join(__dirname, 'evolver.pid');
+  const lockFile = getLockFilePath();
   try {
     try {
       fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
@@ -217,7 +223,7 @@ function acquireLock() {
 }
 
 function releaseLock() {
-  const lockFile = path.join(__dirname, 'evolver.pid');
+  const lockFile = getLockFilePath();
   try {
     if (fs.existsSync(lockFile)) {
        const pid = parseInt(fs.readFileSync(lockFile, 'utf8').trim(), 10);
@@ -280,22 +286,53 @@ async function main() {
           releaseLock();
           process.exit(1);
         });
-        let _unhandledRejectionCount = 0;
+        // Sliding window: only exit if many rejections cluster in a short
+        // period. A daemon running for weeks can accumulate harmless,
+        // unrelated rejections (transient network blips, hub timeouts);
+        // the original cumulative counter would eventually kill the
+        // process for noise. Cluster = real failure cascade.
+        const REJECTION_WINDOW_MS = 5 * 60 * 1000;
+        const REJECTION_THRESHOLD = 5;
+        let _rejectionTimestamps = [];
         process.on('unhandledRejection', (reason) => {
-          _unhandledRejectionCount++;
-          console.error('[FATAL] Unhandled promise rejection (' + _unhandledRejectionCount + '):', reason && reason.stack ? reason.stack : String(reason));
-          if (_unhandledRejectionCount >= 5) {
-            console.error('[FATAL] Too many unhandled rejections (' + _unhandledRejectionCount + '). Exiting to avoid corrupt state.');
+          const now = Date.now();
+          _rejectionTimestamps.push(now);
+          _rejectionTimestamps = _rejectionTimestamps.filter(function (t) {
+            return now - t < REJECTION_WINDOW_MS;
+          });
+          console.error('[FATAL] Unhandled promise rejection (' + _rejectionTimestamps.length + ' in window):', reason && reason.stack ? reason.stack : String(reason));
+          if (_rejectionTimestamps.length >= REJECTION_THRESHOLD) {
+            console.error('[FATAL] ' + _rejectionTimestamps.length + ' unhandled rejections within ' + (REJECTION_WINDOW_MS / 1000) + 's. Exiting to avoid corrupt state.');
             releaseLock();
             process.exit(1);
           }
         });
 
         process.env.EVOLVE_LOOP = 'true';
+        // Issue #96: from v1.85.0, --loop defaults EVOLVE_BRIDGE=true so the
+        // daemon actually evolves the working tree. The previous default of
+        // 'false' caused 33 days of empty cycling on Aurora — every cycle
+        // hit rejectPendingRun(reason=loop_bridge_disabled_autoreject_no_rollback)
+        // and produced no EvolutionEvent. Failed cycles still recover safely
+        // via rollbackTracked (src/gep/gitOps.js#rollbackTracked, mode=stash
+        // by default since v1.81.0): the daemon's changes get pushed to a
+        // stash entry the user can recover with `git stash pop`.
+        // Set EVOLVE_BRIDGE=false explicitly to opt back into observe-only.
         if (!process.env.EVOLVE_BRIDGE) {
-          process.env.EVOLVE_BRIDGE = 'false';
+          process.env.EVOLVE_BRIDGE = 'true';
         }
+        const bridgeEnabled = String(process.env.EVOLVE_BRIDGE).toLowerCase() !== 'false';
         console.log(`Loop mode enabled (internal daemon, bridge=${process.env.EVOLVE_BRIDGE}, verbose=${isVerbose}).`);
+        if (bridgeEnabled) {
+          console.warn('[Daemon] EVOLVE_BRIDGE=true (default since v1.85.0).');
+          console.warn('[Daemon]   evolver may modify your working tree.');
+          console.warn('[Daemon]   Failed cycles auto-stash via "git stash push --include-untracked".');
+          console.warn('[Daemon]   Recover: git stash list | grep evolver-rollback');
+          console.warn('[Daemon]   Set EVOLVE_BRIDGE=false to opt out (observe-only mode).');
+        } else {
+          console.warn('[Daemon] EVOLVE_BRIDGE=false: evolver will NOT modify your working tree (observe-only).');
+          console.warn('[Daemon]   To enable real evolution: unset EVOLVE_BRIDGE or set it to "true".');
+        }
 
         // Startup diagnostic: in daemon mode evolver consumes its own stdout
         // instead of handing `sessions_spawn(...)` directives to a host

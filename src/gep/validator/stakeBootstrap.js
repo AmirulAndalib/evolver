@@ -29,6 +29,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { buildHubHeaders, getHubUrl, getNodeId } = require('../a2aProtocol');
+const { hubFetch } = require('../hubFetch');
 const { resolveHubUrl: resolveDefaultHubUrl } = require('../../config');
 
 const DEFAULT_STAKE_AMOUNT = Number(process.env.EVOLVER_VALIDATOR_STAKE_AMOUNT) || 100;
@@ -235,7 +236,7 @@ async function ensureValidatorStake(opts) {
   let res;
   let text = '';
   try {
-    res = await fetch(url, {
+    res = await hubFetch(url, {
       method: 'POST',
       headers: buildHubHeaders(),
       body: JSON.stringify(body),

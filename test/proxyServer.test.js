@@ -48,10 +48,18 @@ function request(url, method, body, token) {
 describe('ProxyHttpServer', () => {
   let store, server, baseUrl, dataDir, serverToken;
   let authedReq;
+  let savedSettingsDir;
+  let settingsDir;
 
   before(async () => {
     dataDir = tmpDataDir();
     store = new MailboxStore(dataDir);
+    // Redirect proxy settings into a temp dir so server.start() does not
+    // write to the shared ~/.evolver/settings.json and race with the webui
+    // observer test running in a parallel worker.
+    settingsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'proxy-settings-'));
+    savedSettingsDir = process.env.EVOLVER_SETTINGS_DIR;
+    process.env.EVOLVER_SETTINGS_DIR = settingsDir;
 
     const mockProxyHandlers = {
       assetFetch: async (body) => ({ assets: [], query: body }),
@@ -72,6 +80,9 @@ describe('ProxyHttpServer', () => {
     await server.stop();
     store.close();
     try { fs.rmSync(dataDir, { recursive: true }); } catch {}
+    try { fs.rmSync(settingsDir, { recursive: true }); } catch {}
+    if (savedSettingsDir === undefined) delete process.env.EVOLVER_SETTINGS_DIR;
+    else process.env.EVOLVER_SETTINGS_DIR = savedSettingsDir;
   });
 
   describe('POST /mailbox/send', () => {

@@ -9,7 +9,8 @@
 // or cannot sandbox-execute will simply skip and try again next cycle.
 'use strict';
 
-const { getNodeId, buildHubHeaders, getHubUrl } = require('../a2aProtocol');
+const { getNodeId, buildHubHeaders } = require('../a2aProtocol');
+const { hubFetch } = require('../hubFetch');
 const { runInSandbox, runPreflight } = require('./sandboxExecutor');
 const { buildReportPayload, submitReport } = require('./reporter');
 const { ensureValidatorStake } = require('./stakeBootstrap');
@@ -35,10 +36,13 @@ function isValidatorEnabled() {
 }
 
 function resolveHubUrl() {
-  try {
-    const u = getHubUrl && getHubUrl();
-    if (u && typeof u === 'string') return u;
-  } catch (_) {}
+  // Always go through config.resolveHubUrl() — it reads the same env vars
+  // getHubUrl() reads plus EVOLVER_DEFAULT_HUB_URL, falls back to the
+  // PUBLIC_DEFAULT_HUB_URL constant, and enforces the https schema check
+  // (with EVOMAP_HUB_ALLOW_INSECURE=1 as the explicit escape hatch).
+  // Preferring the raw getHubUrl() here would let an http:// URL slip past
+  // this frame; hubFetch would still catch it, but the in-validator code
+  // path should not look like it accepts an unvalidated URL.
   return resolveDefaultHubUrl();
 }
 
@@ -74,7 +78,7 @@ async function fetchValidationTasks() {
   };
 
   try {
-    const res = await fetch(url, {
+    const res = await hubFetch(url, {
       method: 'POST',
       headers: buildHubHeaders(),
       body: JSON.stringify(msg),

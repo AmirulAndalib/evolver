@@ -14,7 +14,7 @@ const { execSync } = require('child_process');
 // on large repos). See GHSA reports / issue #451.
 const MAX_EXEC_BUFFER = 10 * 1024 * 1024;
 
-const { getEvolutionDir, getRepoRoot } = require('./paths');
+const { getEvolutionDir, getRepoRoot, getEvolverInstallRoot } = require('./paths');
 const { fullLeakCheck, redactString } = require('./sanitize');
 const {
   SELF_PR_MIN_SCORE,
@@ -28,35 +28,52 @@ const {
 
 const STATE_FILE = 'self_pr_state.json';
 
-// Files obfuscated in public.manifest.json -- PRs touching these are meaningless.
-const OBFUSCATED_FILES = new Set([
-  'src/evolve.js',
-  'src/gep/selector.js',
-  'src/gep/mutation.js',
-  'src/gep/solidify.js',
-  'src/gep/prompt.js',
-  'src/gep/candidates.js',
-  'src/gep/reflection.js',
-  'src/gep/narrativeMemory.js',
-  'src/gep/curriculum.js',
-  'src/gep/personality.js',
-  'src/gep/learningSignals.js',
-  'src/gep/memoryGraph.js',
-  'src/gep/memoryGraphAdapter.js',
-  'src/gep/strategy.js',
-  'src/gep/candidateEval.js',
-  'src/gep/hubVerify.js',
-  'src/gep/crypto.js',
-  'src/gep/contentHash.js',
-  'src/gep/a2aProtocol.js',
-  'src/gep/hubSearch.js',
-  'src/gep/hubReview.js',
-  'src/gep/policyCheck.js',
-  'src/gep/deviceId.js',
-  'src/gep/envFingerprint.js',
-  'src/gep/skillDistiller.js',
-  'src/gep/explore.js',
-]);
+// Files obfuscated in public.manifest.json -- PRs touching these would land
+// raw source on the public repo where the file ships obfuscated, leaking
+// implementation detail. Source of truth: public.manifest.json `obfuscate`
+// array, loaded lazily on first use.
+//
+// public.manifest.json is itself excluded from the npm package (it's a
+// build-time artifact for the obfuscation pipeline), so on npm installs the
+// file is absent. That is expected — self-PR is dev-only (gated by
+// EVOLVER_SELF_PR=true) and a missing manifest correctly produces the
+// fail-safe behavior (reject all files). We therefore stay silent on load
+// failure here and only surface a warning when maybeCreatePR is actually
+// invoked but the manifest cannot be read.
+let _obfuscatedFilesCache;     // undefined = not loaded; Set | null after first attempt
+let _manifestLoadError = null;
+let _warnedAboutMissingManifest = false;
+
+function loadObfuscatedFromManifest() {
+  if (_obfuscatedFilesCache !== undefined) return _obfuscatedFilesCache;
+  try {
+    const manifestPath = path.join(getEvolverInstallRoot(), 'public.manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    if (!Array.isArray(manifest.obfuscate)) {
+      throw new Error('public.manifest.json missing `obfuscate` array');
+    }
+    // Reject glob patterns: build_public.js may expand them, but Set.has(rel)
+    // would silently miss matches and reintroduce the drift this PR fixed.
+    for (const f of manifest.obfuscate) {
+      if (typeof f !== 'string' || /[*?[\]]/.test(f)) {
+        throw new Error('public.manifest.json `obfuscate` must contain literal paths, got: ' + JSON.stringify(f));
+      }
+    }
+    _obfuscatedFilesCache = new Set(manifest.obfuscate.map((f) => f.replace(/\\/g, '/').replace(/^\.\/+/, '')));
+  } catch (e) {
+    _manifestLoadError = e.message;
+    _obfuscatedFilesCache = null;
+  }
+  return _obfuscatedFilesCache;
+}
+
+// Test-only: reset the lazy cache so a test can exercise the load path
+// (e.g. cover the fail-safe branch after a missing manifest is restored).
+function _resetObfuscatedCache() {
+  _obfuscatedFilesCache = undefined;
+  _manifestLoadError = null;
+  _warnedAboutMissingManifest = false;
+}
 
 // Files that are included in the public manifest (superset patterns).
 const PUBLIC_INCLUDE_PREFIXES = ['src/', 'scripts/'];
@@ -70,7 +87,9 @@ function normalizeRel(filePath) {
 function isPublicNonObfuscated(filePath) {
   const rel = normalizeRel(filePath);
   if (!rel) return false;
-  if (OBFUSCATED_FILES.has(rel)) return false;
+  const obfuscated = loadObfuscatedFromManifest();
+  if (obfuscated === null) return false; // fail-safe when manifest is unreadable
+  if (obfuscated.has(rel)) return false;
   for (const excl of PUBLIC_EXCLUDE_PREFIXES) {
     if (rel.startsWith(excl)) return false;
   }
@@ -244,6 +263,16 @@ function getGitDiff(changedFiles, repoRoot) {
 async function maybeCreatePR({ capsule, event, mutation, gene, blastRadius }) {
   if (String(process.env.EVOLVER_SELF_PR || '').toLowerCase() !== 'true') return null;
 
+  // User has explicitly opted into self-PR. Ensure we have the obfuscate
+  // list so we don't accidentally leak obfuscated source via a "non-obf" PR.
+  if (loadObfuscatedFromManifest() === null) {
+    if (!_warnedAboutMissingManifest) {
+      console.warn('[SelfPR] public.manifest.json not found at ' + getEvolverInstallRoot() + ' — rejecting all self-PRs (manifest is required to identify obfuscated files). Error: ' + _manifestLoadError);
+      _warnedAboutMissingManifest = true;
+    }
+    return null;
+  }
+
   const score = capsule && capsule.outcome ? (capsule.outcome.score || 0) : 0;
   const streak = capsule ? (capsule.success_streak || 0) : 0;
 
@@ -402,5 +431,6 @@ module.exports = {
   writeState,
   recordPR,
   // For testing
-  _OBFUSCATED_FILES: OBFUSCATED_FILES,
+  _loadObfuscatedFromManifest: loadObfuscatedFromManifest,
+  _resetObfuscatedCache,
 };

@@ -15,7 +15,12 @@
 // in the prompt template, it MUST be defined here. NEVER duplicate it inline.
 // ---------------------------------------------------------------------------
 
-const { VALID_CATEGORIES } = require('./gene');
+const {
+  VALID_CATEGORIES,
+  VALID_ROUTING_TIERS,
+  VALID_REASONING_LEVELS,
+  VALID_TOOL_POLICY_SEVERITIES,
+} = require('./gene');
 const { VALID_OUTCOME_STATUSES } = require('./capsule');
 
 const VALID_RISK_LEVELS = ['low', 'medium', 'high'];
@@ -38,6 +43,9 @@ module.exports = {
   VALID_OUTCOME_STATUSES,
   VALID_RISK_LEVELS,
   VALID_TRACE_STAGES,
+  VALID_ROUTING_TIERS,
+  VALID_REASONING_LEVELS,
+  VALID_TOOL_POLICY_SEVERITIES,
   renderEnum,
   renderEnumList,
 };

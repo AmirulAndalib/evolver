@@ -346,3 +346,55 @@ describe('opencode adapter: isEvolverManagedPluginFile', () => {
     } finally { cleanup(tmp); }
   });
 });
+
+// PR #94 round-5: nested-subdir symlink hole. opencode is the only adapter
+// that owns *two* nested subdirs (`hooks/` for the shared scripts, `plugins/`
+// for the auto-generated evolver.js). Both must be guarded.
+describe('opencode adapter: rejects symlinked nested subdirs (PR #94 round-5)', () => {
+  it('install refuses symlinked .opencode/hooks', () => {
+    const tmp = makeTmpDir();
+    try {
+      const realConfig = path.join(tmp, '.opencode');
+      fs.mkdirSync(realConfig, { recursive: true });
+      const target = path.join(tmp, 'redirect');
+      fs.mkdirSync(target, { recursive: true });
+      fs.symlinkSync(target, path.join(realConfig, 'hooks'), 'dir');
+      const evolverRoot = path.resolve(__dirname, '..');
+      assert.throws(
+        () => opencodeAdapter.install({ configRoot: tmp, evolverRoot, force: true }),
+        /symbolic link/i
+      );
+    } finally { cleanup(tmp); }
+  });
+
+  it('install refuses symlinked .opencode/plugins', () => {
+    const tmp = makeTmpDir();
+    try {
+      const realConfig = path.join(tmp, '.opencode');
+      fs.mkdirSync(realConfig, { recursive: true });
+      const target = path.join(tmp, 'redirect');
+      fs.mkdirSync(target, { recursive: true });
+      fs.symlinkSync(target, path.join(realConfig, 'plugins'), 'dir');
+      const evolverRoot = path.resolve(__dirname, '..');
+      assert.throws(
+        () => opencodeAdapter.install({ configRoot: tmp, evolverRoot, force: true }),
+        /symbolic link/i
+      );
+    } finally { cleanup(tmp); }
+  });
+
+  it('uninstall refuses symlinked nested dirs', () => {
+    const tmp = makeTmpDir();
+    try {
+      const realConfig = path.join(tmp, '.opencode');
+      fs.mkdirSync(realConfig, { recursive: true });
+      const target = path.join(tmp, 'redirect');
+      fs.mkdirSync(target, { recursive: true });
+      fs.symlinkSync(target, path.join(realConfig, 'hooks'), 'dir');
+      assert.throws(
+        () => opencodeAdapter.uninstall({ configRoot: tmp }),
+        /symbolic link/i
+      );
+    } finally { cleanup(tmp); }
+  });
+});

@@ -19,6 +19,17 @@ const assert = require('node:assert');
 
 const { LifecycleManager } = require('../src/proxy/lifecycle/manager');
 
+// LifecycleManager calls hubFetch internally; tests here stub global.fetch
+// and pass a fake `https://example.test` hubUrl. In insecure mode hubFetch
+// routes through global.fetch so the stubs apply. node --test gives each
+// file its own worker process, so this env var does not leak.
+const _origLifecycleSecretInsecure = process.env.EVOMAP_HUB_ALLOW_INSECURE;
+process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
+test.after(() => {
+  if (_origLifecycleSecretInsecure === undefined) delete process.env.EVOMAP_HUB_ALLOW_INSECURE;
+  else process.env.EVOMAP_HUB_ALLOW_INSECURE = _origLifecycleSecretInsecure;
+});
+
 const VALID_HEX64_A = 'a'.repeat(64);
 const VALID_HEX64_B = 'b'.repeat(64);
 

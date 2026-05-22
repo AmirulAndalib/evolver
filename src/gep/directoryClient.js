@@ -6,6 +6,7 @@
 
 const { getNodeId, buildHubHeaders } = require('./a2aProtocol');
 const { resolveHubUrl } = require('../config');
+const { hubFetch } = require('./hubFetch');
 
 const DIRECTORY_TIMEOUT_MS = 8000;
 
@@ -22,7 +23,7 @@ async function searchByQuery(query, opts) {
     if (opts?.limit) params.set('limit', String(opts.limit));
 
     const url = `${resolveHubUrl().replace(/\/+$/, '')}/a2a/directory/search?${params}`;
-    const res = await fetch(url, {
+    const res = await hubFetch(url, {
       headers: buildHubHeaders(),
       signal: AbortSignal.timeout(DIRECTORY_TIMEOUT_MS),
     });
@@ -48,7 +49,7 @@ async function searchBySignals(signals, opts) {
     if (opts?.limit) params.set('limit', String(opts.limit));
 
     const url = `${resolveHubUrl().replace(/\/+$/, '')}/a2a/directory/search?${params}`;
-    const res = await fetch(url, {
+    const res = await hubFetch(url, {
       headers: buildHubHeaders(),
       signal: AbortSignal.timeout(DIRECTORY_TIMEOUT_MS),
     });
@@ -70,7 +71,7 @@ async function getAgentProfile(nodeId) {
   if (!nodeId) return null;
   try {
     const url = `${resolveHubUrl().replace(/\/+$/, '')}/a2a/directory/profile/${encodeURIComponent(nodeId)}`;
-    const res = await fetch(url, {
+    const res = await hubFetch(url, {
       headers: buildHubHeaders(),
       signal: AbortSignal.timeout(DIRECTORY_TIMEOUT_MS),
     });

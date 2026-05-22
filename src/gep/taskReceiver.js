@@ -8,6 +8,7 @@
 
 const { getNodeId, buildHubHeaders } = require('./a2aProtocol');
 const { resolveHubUrl } = require('../config');
+const { hubFetch } = require('./hubFetch');
 const { createTask, validateTask } = require('./schemas/task');
 
 function buildAuthHeaders() {
@@ -61,7 +62,7 @@ async function fetchTasks(opts) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 8000);
 
-    const res = await fetch(url, {
+    const res = await hubFetch(url, {
       method: 'POST',
       headers: buildAuthHeaders(),
       body: JSON.stringify(msg),
@@ -368,7 +369,7 @@ async function claimTask(taskId, opts) {
       body.commitment_deadline = opts.commitment_deadline;
     }
 
-    const res = await fetch(url, {
+    const res = await hubFetch(url, {
       method: 'POST',
       headers: buildAuthHeaders(),
       body: JSON.stringify(body),
@@ -397,7 +398,7 @@ async function completeTask(taskId, assetId) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
 
-    const res = await fetch(url, {
+    const res = await hubFetch(url, {
       method: 'POST',
       headers: buildAuthHeaders(),
       body: JSON.stringify({ task_id: taskId, asset_id: assetId, node_id: nodeId }),
@@ -448,7 +449,7 @@ async function claimWorkerTask(taskId) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
 
-    const res = await fetch(url, {
+    const res = await hubFetch(url, {
       method: 'POST',
       headers: buildAuthHeaders(),
       body: JSON.stringify({ task_id: taskId, node_id: nodeId }),
@@ -472,7 +473,7 @@ async function completeWorkerTask(assignmentId, resultAssetId) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
 
-    const res = await fetch(url, {
+    const res = await hubFetch(url, {
       method: 'POST',
       headers: buildAuthHeaders(),
       body: JSON.stringify({ assignment_id: assignmentId, node_id: nodeId, result_asset_id: resultAssetId }),

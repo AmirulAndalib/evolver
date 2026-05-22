@@ -200,6 +200,97 @@ describe('loop-mode non-fatal error handling', () => {
   });
 });
 
+describe('loop-mode EVOLVE_BRIDGE default (issue #96)', () => {
+  // From v1.85.0 the daemon defaults EVOLVE_BRIDGE=true so cycles actually
+  // evolve the working tree. The previous default 'false' produced no
+  // EvolutionEvents on Aurora over 33 days because every cycle hit
+  // rejectPendingRun(reason=loop_bridge_disabled_autoreject_no_rollback).
+  // These tests verify the default flip and the safety banner.
+  const { execFileSync } = require('child_process');
+  const repoRoot = path.resolve(__dirname, '..');
+
+  // Use the test-scoped tmpDir as REPO_ROOT so a leftover `.evolver.lock`
+  // in the dev repo (e.g. during a release prep) does not preflight-yield
+  // the spawned daemon and short-circuit the test. Init it as a git repo
+  // since the daemon refuses to run outside of one.
+  function ensureGitRepo(dir) {
+    try {
+      execFileSync('git', ['init', '-q'], { cwd: dir, stdio: 'ignore' });
+      execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir, stdio: 'ignore' });
+      execFileSync('git', ['config', 'user.name', 'test'], { cwd: dir, stdio: 'ignore' });
+      execFileSync('git', ['commit', '--allow-empty', '-m', 'init', '-q'], { cwd: dir, stdio: 'ignore' });
+    } catch (_) { /* best-effort */ }
+  }
+
+  function runDaemonOnce(extraEnv) {
+    ensureGitRepo(tmpDir);
+    let out = '';
+    let err = '';
+    try {
+      const result = execFileSync(process.execPath, [path.join(repoRoot, 'index.js'), '--loop'], {
+        cwd: tmpDir,
+        encoding: 'utf8',
+        timeout: 30000,
+        env: {
+          ...process.env,
+          EVOLVE_LOOP: 'true',
+          A2A_HUB_URL: '',
+          EVOLVER_REPO_ROOT: tmpDir,
+          // Isolate the singleton pid-file in tmpDir so concurrent tests (and
+          // a real daemon at the dev repo) do not block this spawn.
+          EVOLVER_LOCK_DIR: tmpDir,
+          EVOLVER_MAX_CYCLES_PER_PROCESS: '1',
+          ...extraEnv,
+        },
+      });
+      out = result;
+    } catch (e) {
+      out = e.stdout || '';
+      err = e.stderr || '';
+    }
+    return out + err;
+  }
+
+  it('--loop with EVOLVE_BRIDGE unset defaults to bridge=true', () => {
+    const combined = runDaemonOnce({ EVOLVE_BRIDGE: '' });
+    assert.ok(
+      /bridge=true/.test(combined),
+      'combined output should announce bridge=true: ' + combined.slice(0, 500)
+    );
+  });
+
+  it('--loop with EVOLVE_BRIDGE=true keeps bridge=true', () => {
+    const combined = runDaemonOnce({ EVOLVE_BRIDGE: 'true' });
+    assert.ok(
+      /bridge=true/.test(combined),
+      'explicit true should be honored: ' + combined.slice(0, 500)
+    );
+  });
+
+  it('--loop with EVOLVE_BRIDGE=false still respected (opt-out)', () => {
+    const combined = runDaemonOnce({ EVOLVE_BRIDGE: 'false' });
+    assert.ok(
+      /bridge=false/.test(combined),
+      'explicit false must be honored as opt-out: ' + combined.slice(0, 500)
+    );
+    assert.ok(
+      /observe-only/.test(combined),
+      'opt-out banner should mention observe-only: ' + combined.slice(0, 500)
+    );
+  });
+
+  it('bridge=true banner mentions stash recovery', () => {
+    // The safety banner is the one mitigation that compensates for the
+    // riskier default. If the message is missing or rewritten, users lose
+    // the recovery breadcrumb -- they must see "git stash" in the warning.
+    const combined = runDaemonOnce({ EVOLVE_BRIDGE: '' });
+    assert.ok(
+      /git stash/.test(combined),
+      'safety banner must reference git stash recovery: ' + combined.slice(0, 800)
+    );
+  });
+});
+
 describe('bare invocation routing -- black-box', () => {
   const { execFileSync } = require('child_process');
   const repoRoot = path.resolve(__dirname, '..');

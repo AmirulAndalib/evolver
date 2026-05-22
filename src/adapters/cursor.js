@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { mergeJsonFile, copyHookScripts, removeEvolverHooks, removeHookScripts } = require('./hookAdapter');
+const { mergeJsonFile, copyHookScripts, removeEvolverHooks, removeHookScripts, assertSafeConfigDir } = require('./hookAdapter');
 
 const HOOK_SCRIPTS_DIR_NAME = 'hooks';
 
@@ -39,6 +39,7 @@ function install({ configRoot, evolverRoot, force }) {
   const cursorDir = path.join(configRoot, '.cursor');
   const hooksJsonPath = path.join(cursorDir, 'hooks.json');
   const hooksDir = path.join(cursorDir, HOOK_SCRIPTS_DIR_NAME);
+  assertSafeConfigDir(cursorDir, '.cursor', { subdirs: [HOOK_SCRIPTS_DIR_NAME] });
 
   if (!force && fs.existsSync(hooksJsonPath)) {
     try {
@@ -73,6 +74,7 @@ function uninstall({ configRoot, evolverRoot }) {
   const cursorDir = path.join(configRoot, '.cursor');
   const hooksJsonPath = path.join(cursorDir, 'hooks.json');
   const hooksDir = path.join(cursorDir, HOOK_SCRIPTS_DIR_NAME);
+  assertSafeConfigDir(cursorDir, '.cursor', { subdirs: [HOOK_SCRIPTS_DIR_NAME] });
 
   const removed = removeEvolverHooks(hooksJsonPath);
   const scripts = removeHookScripts(hooksDir);

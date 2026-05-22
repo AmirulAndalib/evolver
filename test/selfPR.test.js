@@ -15,8 +15,12 @@ const {
   readState,
   writeState,
   recordPR,
-  _OBFUSCATED_FILES,
+  _loadObfuscatedFromManifest,
+  _resetObfuscatedCache,
 } = require('../src/gep/selfPR');
+
+const _OBFUSCATED_FILES = _loadObfuscatedFromManifest();
+assert.ok(_OBFUSCATED_FILES, 'public.manifest.json must load in test env');
 
 // --- isPublicNonObfuscated ---
 
@@ -65,6 +69,41 @@ describe('isPublicNonObfuscated', () => {
     for (const f of _OBFUSCATED_FILES) {
       assert.equal(isPublicNonObfuscated(f), false, f + ' should be rejected');
     }
+  });
+
+  it('rejects glob patterns in manifest obfuscate list (fail-safe)', () => {
+    const manifestPath = path.join(__dirname, '..', 'public.manifest.json');
+    const original = fs.readFileSync(manifestPath, 'utf8');
+    const tampered = JSON.parse(original);
+    tampered.obfuscate.push('src/gep/*.js');
+    fs.writeFileSync(manifestPath, JSON.stringify(tampered));
+    try {
+      _resetObfuscatedCache();
+      const result = _loadObfuscatedFromManifest();
+      assert.equal(result, null, 'loader must fail-safe on glob patterns');
+    } finally {
+      fs.writeFileSync(manifestPath, original);
+      _resetObfuscatedCache();
+    }
+  });
+
+  it('OBFUSCATED_FILES stays in sync with public.manifest.json (no drift)', () => {
+    const manifestPath = path.join(__dirname, '..', 'public.manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    // Apply the same normalization as loadObfuscatedFromManifest in selfPR.js so a
+    // future manifest entry like `./src/foo.js` does not produce a false-fail drift.
+    const normalize = (f) => String(f || '').replace(/\\/g, '/').replace(/^\.\/+/, '');
+    const manifestList = new Set((manifest.obfuscate || []).map(normalize));
+    // Every file the build pipeline obfuscates must be rejected by self-PR.
+    for (const f of manifestList) {
+      assert.ok(_OBFUSCATED_FILES.has(f), f + ' is in public.manifest.json but missing from selfPR OBFUSCATED_FILES');
+      assert.equal(isPublicNonObfuscated(f), false, f + ' should be rejected by isPublicNonObfuscated');
+    }
+    // And the set should not have stale entries that the manifest no longer obfuscates.
+    for (const f of _OBFUSCATED_FILES) {
+      assert.ok(manifestList.has(f), f + ' is in selfPR OBFUSCATED_FILES but not in public.manifest.json');
+    }
+    assert.equal(_OBFUSCATED_FILES.size, manifestList.size, 'set sizes must match');
   });
 });
 

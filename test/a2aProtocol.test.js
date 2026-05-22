@@ -189,13 +189,19 @@ describe('sendHeartbeat log touch', () => {
   var originalFetch;
   var originalHubUrl;
   var originalLogsDir;
+  var originalInsecure;
 
   before(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'evolver-hb-test-'));
     originalHubUrl = process.env.A2A_HUB_URL;
     originalLogsDir = process.env.EVOLVER_LOGS_DIR;
+    originalInsecure = process.env.EVOMAP_HUB_ALLOW_INSECURE;
     process.env.A2A_HUB_URL = 'http://localhost:19999';
     process.env.EVOLVER_LOGS_DIR = tmpDir;
+    // hubFetch enforces https:// by default; tests use a fake http URL with
+    // a stubbed fetch, so opt into insecure mode to bypass URL validation
+    // and have hubFetch route through global.fetch (where the stub lives).
+    process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
     originalFetch = global.fetch;
   });
 
@@ -211,6 +217,8 @@ describe('sendHeartbeat log touch', () => {
     } else {
       process.env.EVOLVER_LOGS_DIR = originalLogsDir;
     }
+    if (originalInsecure === undefined) delete process.env.EVOMAP_HUB_ALLOW_INSECURE;
+    else process.env.EVOMAP_HUB_ALLOW_INSECURE = originalInsecure;
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -389,17 +397,22 @@ describe('mergeAndCap', () => {
 describe('httpTransportReceive asset_id filter', () => {
   var originalFetch;
   var originalHubUrl;
+  var originalInsecure;
 
   before(() => {
     originalFetch = global.fetch;
     originalHubUrl = process.env.A2A_HUB_URL;
+    originalInsecure = process.env.EVOMAP_HUB_ALLOW_INSECURE;
     process.env.A2A_HUB_URL = 'http://localhost:19999';
+    process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
   });
 
   after(() => {
     global.fetch = originalFetch;
     if (originalHubUrl === undefined) delete process.env.A2A_HUB_URL;
     else process.env.A2A_HUB_URL = originalHubUrl;
+    if (originalInsecure === undefined) delete process.env.EVOMAP_HUB_ALLOW_INSECURE;
+    else process.env.EVOMAP_HUB_ALLOW_INSECURE = originalInsecure;
   });
 
   it('discards assets with no asset_id (tamper bypass prevention)', async () => {

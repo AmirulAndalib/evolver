@@ -14,6 +14,7 @@ const ENV_KEYS = [
   'SKILLS_DIR',
   'AGENT_SESSIONS_DIR',
   'EVOLVER_LOGS_DIR',
+  'EVOLVER_SETTINGS_DIR',
   'EVOLVER_ATP_AUTOBUY',
   'ATP_AUTOBUY_DAILY_CAP_CREDITS',
   'ATP_AUTOBUY_PER_ORDER_CAP_CREDITS',
@@ -58,6 +59,11 @@ describe('webui observer', () => {
     process.env.SKILLS_DIR = path.join(tmpDir, 'skills');
     process.env.AGENT_SESSIONS_DIR = path.join(tmpDir, 'sessions');
     process.env.EVOLVER_LOGS_DIR = path.join(tmpDir, 'logs');
+    // Isolate the proxy settings file from sibling test workers writing to
+    // the shared ~/.evolver/settings.json. Without this, a parallel proxy
+    // server test causes getStatus() to return mode='proxy_only' instead of
+    // 'idle' for the "files are missing" case.
+    process.env.EVOLVER_SETTINGS_DIR = path.join(tmpDir, 'settings');
   });
 
   afterEach(() => {

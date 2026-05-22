@@ -154,13 +154,100 @@ class ProxyHttpServer {
     try {
       const body = (req.method === 'POST' || req.method === 'PUT') ? await parseBody(req) : {};
       const query = Object.fromEntries(url.searchParams);
-      const result = await handler({ body, query, params });
-      sendJson(res, result.status || 200, result.body || result);
+      const headers = req.headers;
+      const result = await handler({ body, query, params, headers });
+      if (result && result.stream) {
+        await this._streamResponse(res, result);
+      } else {
+        sendJson(res, result.status || 200, result.body || result);
+      }
     } catch (err) {
       this.logger.error(`[proxy] ${routeKey} error:`, err.message);
-      sendJson(res, err.statusCode || 500, {
-        error: err.message || 'Internal error',
-      });
+      if (res.headersSent) {
+        try { res.end(); } catch { /* ignore */ }
+      } else {
+        sendJson(res, err.statusCode || 500, {
+          error: err.message || 'Internal error',
+        });
+      }
+    }
+  }
+
+  // SSE / pass-through streaming path used by /v1/messages (slice 5).
+  // `result.stream` may be any async iterable yielding Buffer or string
+  // chunks (Web ReadableStream from fetch, or a Node Readable). Headers
+  // default to text/event-stream so Anthropic-style SSE bytes piped
+  // through reach the client unmodified. The caller owns producing
+  // correctly-framed SSE; this method only relays bytes.
+  async _streamResponse(res, result) {
+    const headers = Object.assign({
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    }, result.headers || {});
+    res.writeHead(result.status || 200, headers);
+
+    // Browsers, network blips, and Ctrl-C all close the SSE socket mid-stream.
+    // If we await `drain` without watching for `close`, the drain event never
+    // fires on a destroyed socket and this coroutine hangs forever — which
+    // also pins the upstream fetch body open (real Anthropic socket leak, not
+    // just coroutine leak). For Web ReadableStream upstreams we read via an
+    // explicit reader so cancellation can go through the same lock; for sync
+    // generators / Node Readables we fall back to for-await.
+    const stream = result.stream;
+    const reader = stream && typeof stream.getReader === 'function' ? stream.getReader() : null;
+
+    let clientGone = false;
+    const onClose = () => {
+      clientGone = true;
+      if (reader) {
+        reader.cancel().catch(() => { /* upstream already settled */ });
+      } else if (stream && typeof stream.destroy === 'function') {
+        try { stream.destroy(); } catch { /* ignore */ }
+      }
+    };
+    res.once('close', onClose);
+
+    const awaitBackpressure = () => new Promise((resolve) => {
+      let settled = false;
+      const onDrain = () => {
+        if (settled) return;
+        settled = true;
+        res.off('close', onCloseInner);
+        resolve();
+      };
+      const onCloseInner = () => {
+        if (settled) return;
+        settled = true;
+        res.off('drain', onDrain);
+        resolve();
+      };
+      res.once('drain', onDrain);
+      res.once('close', onCloseInner);
+    });
+
+    try {
+      if (reader) {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done || clientGone) break;
+          if (!res.write(value)) {
+            await awaitBackpressure();
+            if (clientGone) break;
+          }
+        }
+      } else {
+        for await (const chunk of stream) {
+          if (clientGone) break;
+          if (!res.write(chunk)) {
+            await awaitBackpressure();
+            if (clientGone) break;
+          }
+        }
+      }
+    } finally {
+      res.off('close', onClose);
+      try { res.end(); } catch { /* socket may already be destroyed */ }
     }
   }
 

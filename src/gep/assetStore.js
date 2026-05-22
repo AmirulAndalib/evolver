@@ -43,10 +43,18 @@ function ensureDir(dir) {
 const LOCK_TIMEOUT_MS = 5000;
 const LOCK_RETRY_INTERVAL_MS = 20;
 
+// Synchronous sleep that parks the main thread without burning CPU.
+// Note: this still blocks the event loop (Atomics.wait is sync-blocking
+// on the main thread) — heartbeat/ATP/proxy callbacks remain stalled
+// during lock contention. The win here is CPU usage, not responsiveness.
+// Pattern mirrors policyCheck.sleepSync (src/gep/policyCheck.js:435-443).
 function _busyWait(ms) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-    // Intentional synchronous spin; duration is bounded by LOCK_RETRY_INTERVAL_MS.
+  const t = Math.max(0, ms);
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, t);
+  } catch (_) {
+    const end = Date.now() + t;
+    while (Date.now() < end) { /* busy wait fallback */ }
   }
 }
 
@@ -125,7 +133,14 @@ function getDefaultGenes() {
     genes: [
       {
         type: 'Gene', id: 'gene_gep_repair_from_errors', category: 'repair',
-        signals_match: ['error', 'exception', 'failed', 'unstable'],
+        signals_match: [
+          'error|错误|异常|エラー|오류',
+          'exception|异常|例外|예외',
+          'failed|失败|失敗|실패|fail',
+          'unstable|不稳定|不安定|불안정',
+          'log_error',
+          'test_failure',
+        ],
         preconditions: ['signals contains error-related indicators'],
         strategy: [
           'Extract structured signals from logs and user instructions',
@@ -143,7 +158,13 @@ function getDefaultGenes() {
       },
       {
         type: 'Gene', id: 'gene_gep_optimize_prompt_and_assets', category: 'optimize',
-        signals_match: ['protocol', 'gep', 'prompt', 'audit', 'reusable'],
+        signals_match: [
+          'protocol|协议|プロトコル|프로토콜',
+          'gep',
+          'prompt|提示词|提示|プロンプト|프롬프트',
+          'audit|审计|監査|감사',
+          'reusable|可复用|再利用|재사용',
+        ],
         preconditions: ['need stricter, auditable evolution protocol outputs'],
         strategy: [
           'Extract signals and determine selection rationale via Selector JSON',
@@ -161,7 +182,7 @@ function getDefaultGenes() {
       },
       {
         type: 'Gene', id: 'gene_tool_integrity', category: 'repair',
-        signals_match: ['tool_bypass'],
+        signals_match: ['tool_bypass|工具绕过|ツール迂回|도구우회'],
         preconditions: ['agent used shell/exec to perform an action that a registered tool can handle'],
         strategy: [
           'Always prefer registered tools over ad-hoc scripts or shell workarounds',

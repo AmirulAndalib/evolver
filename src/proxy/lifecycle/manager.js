@@ -2,6 +2,7 @@
 
 const { PROXY_PROTOCOL_VERSION } = require('../mailbox/store');
 const crypto = require('crypto');
+const { hubFetch } = require('../../gep/hubFetch');
 
 const DEFAULT_HEARTBEAT_INTERVAL = 360_000;
 const HELLO_TIMEOUT = 15_000;
@@ -137,7 +138,7 @@ class LifecycleManager {
     };
 
     try {
-      const res = await fetch(endpoint, {
+      const res = await hubFetch(endpoint, {
         method: 'POST',
         headers: this._buildHeaders(),
         body: JSON.stringify(body),
@@ -317,7 +318,7 @@ class LifecycleManager {
     };
 
     try {
-      const res = await fetch(endpoint, {
+      const res = await hubFetch(endpoint, {
         method: 'POST',
         headers: this._buildHeaders(),
         body: JSON.stringify(body),

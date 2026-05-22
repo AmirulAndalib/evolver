@@ -7,6 +7,7 @@
 
 const crypto = require('crypto');
 const { buildHubHeaders, getHubUrl, getNodeId } = require('../a2aProtocol');
+const { hubFetch } = require('../hubFetch');
 const { captureEnvFingerprint } = require('../envFingerprint');
 const { resolveHubUrl: resolveDefaultHubUrl } = require('../../config');
 
@@ -172,7 +173,7 @@ async function submitReport(payload) {
   };
 
   try {
-    const res = await fetch(url, {
+    const res = await hubFetch(url, {
       method: 'POST',
       headers: buildHubHeaders(),
       body: JSON.stringify(msg),

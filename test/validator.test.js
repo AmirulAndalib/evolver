@@ -199,6 +199,10 @@ describe('validator.runValidatorCycle', function () {
     process.env.A2A_HUB_URL = 'http://hub.local';
     process.env.HUB_NODE_SECRET = 'secret';
     process.env.A2A_NODE_ID = 'node_test_validator';
+    // validator code goes through hubFetch; tests stub global.fetch and
+    // use http:// fake URLs. Insecure mode bypasses URL check and routes
+    // hubFetch through global.fetch.
+    process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
     // Reset the module-level stake state so each test starts fresh.
     try {
       const sb = require('../src/gep/validator/stakeBootstrap');

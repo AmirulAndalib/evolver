@@ -95,6 +95,94 @@ describe('createGene', () => {
     assert.equal(g2.signals_match.length, 1, 'signals_match arrays should not share references');
     assert.equal(shared.length, 1, 'original partial array should not be mutated');
   });
+
+  // routing_hint / tool_policy are the EvoX-side optional fields wired
+  // through `crates/evox-evo-session/src/lifecycle.rs`. Field name and
+  // enum string drift here would silently degrade to "no opinion" on
+  // the Rust side rather than throw — guard against that here.
+  it('defaults routing_hint and tool_policy to null when omitted', () => {
+    const g = createGene({});
+    assert.equal(g.routing_hint, null);
+    assert.equal(g.tool_policy, null);
+  });
+
+  it('preserves a well-formed routing_hint', () => {
+    const g = createGene({ routing_hint: { tier: 'cheap', reasoning_level: 'low' } });
+    assert.deepEqual(g.routing_hint, { tier: 'cheap', reasoning_level: 'low' });
+  });
+
+  it('drops unknown tier values to null (no silent fallback to a default tier)', () => {
+    // The Rust enum match in lifecycle.rs is exhaustive; a stray tier
+    // would simply be ignored and the gene would emit no hint. Mirror
+    // that here so the JSON written to disk does not mislead.
+    const g = createGene({ routing_hint: { tier: 'ultra', reasoning_level: 'low' } });
+    assert.deepEqual(g.routing_hint, { reasoning_level: 'low' });
+  });
+
+  it('drops empty routing_hint object to null', () => {
+    const g = createGene({ routing_hint: {} });
+    assert.equal(g.routing_hint, null);
+  });
+
+  it('preserves a tool_policy with allow_only + severity', () => {
+    const g = createGene({ tool_policy: { allow_only: ['read', 'grep'], severity: 'block' } });
+    assert.deepEqual(g.tool_policy, { allow_only: ['read', 'grep'], severity: 'block' });
+  });
+
+  it('defaults tool_policy.severity to "warn" when omitted but a list is present', () => {
+    const g = createGene({ tool_policy: { deny: ['git_force_push'] } });
+    assert.deepEqual(g.tool_policy, { deny: ['git_force_push'], severity: 'warn' });
+  });
+
+  it('drops a tool_policy with no allow_only or deny to null', () => {
+    const g = createGene({ tool_policy: { severity: 'block' } });
+    assert.equal(g.tool_policy, null);
+  });
+
+  it('drops empty allow_only after filtering, even when deny has entries (Bugbot 66d2145c)', () => {
+    // String-falsy entries (`''`) get filtered out and the surviving
+    // empty array must NOT leak into the output. On the Rust executor
+    // gate an `allow_only: []` reads as "allow zero tools" and silently
+    // blocks every tool call when the gene only intended a deny list.
+    const g = createGene({
+      tool_policy: {
+        allow_only: ['', ''],
+        deny: ['rm', '-rf'],
+        severity: 'block',
+      },
+    });
+    assert.deepEqual(g.tool_policy, { deny: ['rm', '-rf'], severity: 'block' });
+    assert.equal(g.tool_policy.allow_only, undefined);
+  });
+
+  it('drops empty deny after filtering, even when allow_only has entries (Bugbot 66d2145c)', () => {
+    const g = createGene({
+      tool_policy: {
+        allow_only: ['read'],
+        deny: ['', ''],
+        severity: 'warn',
+      },
+    });
+    assert.deepEqual(g.tool_policy, { allow_only: ['read'], severity: 'warn' });
+    assert.equal(g.tool_policy.deny, undefined);
+  });
+
+  it('drops a tool_policy whose lists are present but all-empty after filter', () => {
+    const g = createGene({
+      tool_policy: { allow_only: [''], deny: [''], severity: 'block' },
+    });
+    assert.equal(g.tool_policy, null);
+  });
+
+  it('routing_hint and tool_policy survive idempotent createGene', () => {
+    const input = { id: 'g-rt', category: 'repair', strategy: ['x'],
+                    routing_hint: { tier: 'mid' },
+                    tool_policy: { deny: ['rm'], severity: 'block' } };
+    const once = createGene(input);
+    const twice = createGene(once);
+    assert.deepEqual(once.routing_hint, twice.routing_hint);
+    assert.deepEqual(once.tool_policy, twice.tool_policy);
+  });
 });
 
 describe('validateGene', () => {

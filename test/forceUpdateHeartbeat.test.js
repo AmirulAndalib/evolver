@@ -36,12 +36,16 @@ describe('heartbeat-triggered force_update', () => {
   var originalProcessExit;
   var exitCalls;
 
+  var originalInsecure;
+
   before(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'evolver-fu-test-'));
     originalHubUrl = process.env.A2A_HUB_URL;
     originalLogsDir = process.env.EVOLVER_LOGS_DIR;
+    originalInsecure = process.env.EVOMAP_HUB_ALLOW_INSECURE;
     process.env.A2A_HUB_URL = 'http://localhost:19999';
     process.env.EVOLVER_LOGS_DIR = tmpDir;
+    process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
     originalFetch = global.fetch;
     originalProcessExit = process.exit;
   });
@@ -53,6 +57,8 @@ describe('heartbeat-triggered force_update', () => {
     else process.env.A2A_HUB_URL = originalHubUrl;
     if (originalLogsDir === undefined) delete process.env.EVOLVER_LOGS_DIR;
     else process.env.EVOLVER_LOGS_DIR = originalLogsDir;
+    if (originalInsecure === undefined) delete process.env.EVOMAP_HUB_ALLOW_INSECURE;
+    else process.env.EVOMAP_HUB_ALLOW_INSECURE = originalInsecure;
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 

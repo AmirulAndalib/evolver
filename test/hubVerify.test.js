@@ -156,4 +156,65 @@ describe('hubVerify offline token integrity (C2)', function () {
       try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
     }
   });
+
+  it('rejects legacy binary .ot file (pre-HMAC format) on upgrade', function () {
+    // Pre-HMAC versions wrote an AES-CBC ciphertext blob to .ot. After upgrade,
+    // loadOfflineToken's JSON.parse throws → catch returns null → consume
+    // returns no_offline_token. Next online verify rewrites in JSON+HMAC form.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ot-hmac-'));
+    try {
+      withEnv({ A2A_NODE_SECRET: 'd'.repeat(64), MEMORY_DIR: tmpDir }, () => {
+        // Raw bytes — not valid JSON.
+        fs.writeFileSync(path.join(tmpDir, '.ot'), Buffer.from([0x00, 0xff, 0xab, 0xcd, 0xef, 0x12, 0x34]));
+        const hv = freshHubVerify(tmpDir);
+        const res = hv.consumeOfflinePermit();
+        assert.strictEqual(res.ok, false);
+        assert.strictEqual(res.error, 'no_offline_token');
+      });
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+    }
+  });
+
+  it('rejects token when nodeSecret is unavailable (misconfig path)', function () {
+    // No A2A_NODE_SECRET env var and a2aProtocol can't supply one
+    // (require fails in this env). loadOfflineToken returns null rather
+    // than accepting an unverifiable token.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ot-hmac-'));
+    try {
+      withEnv({ A2A_NODE_SECRET: undefined, MEMORY_DIR: tmpDir }, () => {
+        // Token file present, signed by some secret — but the running install
+        // has no way to fetch a secret to verify against.
+        const token = { usedCount: 0, expiresAt: Date.now() + 86400000, maxOfflineSolidifies: 10 };
+        makeTokenFile(path.join(tmpDir, '.ot'), token, 'e'.repeat(64));
+        const hv = freshHubVerify(tmpDir);
+        const res = hv.consumeOfflinePermit();
+        assert.strictEqual(res.ok, false);
+        assert.strictEqual(res.error, 'no_offline_token');
+      });
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+    }
+  });
+
+  it('rejects token when HMAC field has wrong length (length-mismatch guard)', function () {
+    // The length pre-check in loadOfflineToken guards crypto.timingSafeEqual,
+    // which throws on mismatched lengths. Truncated/padded HMACs must be
+    // rejected before reaching timingSafeEqual.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ot-hmac-'));
+    try {
+      withEnv({ A2A_NODE_SECRET: 'f'.repeat(64), MEMORY_DIR: tmpDir }, () => {
+        const token = { usedCount: 0, expiresAt: Date.now() + 86400000, maxOfflineSolidifies: 10 };
+        // Truncated HMAC: 30 hex chars → 15 bytes vs expected 32 bytes.
+        const truncatedHmac = 'a'.repeat(30);
+        fs.writeFileSync(path.join(tmpDir, '.ot'), JSON.stringify({ data: token, hmac: truncatedHmac }), 'utf8');
+        const hv = freshHubVerify(tmpDir);
+        const res = hv.consumeOfflinePermit();
+        assert.strictEqual(res.ok, false);
+        assert.strictEqual(res.error, 'no_offline_token');
+      });
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+    }
+  });
 });

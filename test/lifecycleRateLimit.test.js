@@ -5,6 +5,19 @@ const assert = require('node:assert');
 
 const { LifecycleManager } = require('../src/proxy/lifecycle/manager');
 
+// LifecycleManager calls hubFetch internally; tests here stub global.fetch
+// and pass a fake `https://example.test` hubUrl. In insecure mode hubFetch
+// routes through global.fetch so the stubs apply. URL is already https,
+// but this also disables URL validation in case the test resolves to a
+// non-https form. node --test gives each file its own worker process, so
+// this env var does not leak to sibling test files.
+const _origLifecycleInsecure = process.env.EVOMAP_HUB_ALLOW_INSECURE;
+process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
+test.after(() => {
+  if (_origLifecycleInsecure === undefined) delete process.env.EVOMAP_HUB_ALLOW_INSECURE;
+  else process.env.EVOMAP_HUB_ALLOW_INSECURE = _origLifecycleInsecure;
+});
+
 function makeStore() {
   const state = {};
   return {

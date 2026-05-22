@@ -58,6 +58,7 @@ const ENV_KEYS = [
   'EVOLVE_RECALL_VERIFY_FETCH_TIMEOUT_MS',
   'A2A_HUB_URL',
   'A2A_NODE_SECRET',
+  'EVOMAP_HUB_ALLOW_INSECURE',
   'MEMORY_DIR',
   'EVOLUTION_DIR',
   'EVOLVER_REPO_ROOT',
@@ -76,6 +77,7 @@ describe('recallVerifier.enqueuePublishedAsset', () => {
     process.env.EVOLVE_RECALL_VERIFY_ATTEMPTS = '3';
     process.env.A2A_HUB_URL = 'http://localhost:9999';
     process.env.A2A_NODE_SECRET = 'a'.repeat(64);
+    process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
   });
 
   afterEach(() => {
@@ -181,6 +183,7 @@ describe('recallVerifier.verifyOnce', () => {
     process.env.EVOLVE_RECALL_VERIFY = '1';
     process.env.A2A_HUB_URL = 'http://localhost:9999';
     process.env.A2A_NODE_SECRET = 'a'.repeat(64);
+    process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
   });
   afterEach(() => {
     try { fs.rmSync(ctx.tmpDir, { recursive: true, force: true }); } catch (_) {}
@@ -268,6 +271,7 @@ describe('recallVerifier._runWorkerOnce', () => {
     process.env.EVOLVE_RECALL_VERIFY_ATTEMPTS = '3';
     process.env.A2A_HUB_URL = 'http://localhost:9999';
     process.env.A2A_NODE_SECRET = 'a'.repeat(64);
+    process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
   });
   afterEach(() => {
     try { fs.rmSync(ctx.tmpDir, { recursive: true, force: true }); } catch (_) {}

@@ -312,9 +312,20 @@ describe('bench: anti-pattern avoidance', function () {
       strategy: ['fix safely'],
     };
 
-    var result = selectGene([riskyGene, safeGene], ['error'], { effectivePopulationSize: 100 });
-    assert.ok(result.selected);
-    assert.equal(result.selected.id, 'gene_safe', 'Should prefer gene without anti-patterns');
+    // selectGene applies stochastic drift whenever effectivePopulationSize > 0
+    // (1/sqrt(ne) probability), independent of driftEnabled. With ne=100 that
+    // is a flat 10% chance of picking from the top-N at random -- enough to
+    // give this assertion a ~5% flake rate. Pin Math.random so the assertion
+    // measures the score ranking, not the PRNG. Pattern matches selector.test.js.
+    var origRandom = Math.random;
+    Math.random = function () { return 0.99; };
+    try {
+      var result = selectGene([riskyGene, safeGene], ['error'], { effectivePopulationSize: 100 });
+      assert.ok(result.selected);
+      assert.equal(result.selected.id, 'gene_safe', 'Should prefer gene without anti-patterns');
+    } finally {
+      Math.random = origRandom;
+    }
   });
 });
 
