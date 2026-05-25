@@ -8,6 +8,7 @@ const path = require('path');
 const os = require('os');
 
 const { findEvolverRoot, findMemoryGraph } = require('./_runtimePaths');
+const { filterRelevantOutcomes } = require('./_memoryFiltering');
 
 function readLastN(filePath, n) {
   try {
@@ -100,17 +101,19 @@ function main() {
   }
 
   const entries = readLastN(graphPath, 5);
-  if (entries.length === 0) {
+  const filtered = filterRelevantOutcomes(entries);
+
+  if (filtered.length === 0) {
     process.stdout.write(JSON.stringify({}));
     return;
   }
 
-  const successCount = entries.filter(e => e.outcome && e.outcome.status === 'success').length;
-  const failCount = entries.filter(e => e.outcome && e.outcome.status === 'failed').length;
+  const successCount = filtered.filter(e => e.outcome && e.outcome.status === 'success').length;
+  const failCount = filtered.filter(e => e.outcome && e.outcome.status === 'failed').length;
 
-  const lines = entries.map(formatOutcome);
+  const lines = filtered.map(formatOutcome);
   const summary = [
-    `[Evolution Memory] Recent ${entries.length} outcomes (${successCount} success, ${failCount} failed):`,
+    `[Evolution Memory] Recent ${filtered.length} outcomes (${successCount} success, ${failCount} failed):`,
     ...lines,
     '',
     'Use successful approaches. Avoid repeating failed patterns.',
