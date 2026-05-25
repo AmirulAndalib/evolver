@@ -13,9 +13,32 @@ const SIGNAL_KEYWORDS = {
   test_failure: ['test failed', 'test failure', 'assertion', 'expect(', 'assert.'],
 };
 
+function stratifyContent(text) {
+  // Separate code/comments/documents to avoid false positives
+  const lines = text.split('\n');
+  const documentText = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    // Skip lines that are comments or code structure (not document text)
+    if (trimmed.startsWith('//') || trimmed.startsWith('#') || trimmed.startsWith('*') ||
+        trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('}') ||
+        trimmed.startsWith(']') || trimmed.startsWith('/*')) {
+      continue;
+    }
+    documentText.push(line);
+  }
+
+  return documentText.join('\n');
+}
+
 function detectSignals(text) {
   if (!text || typeof text !== 'string') return [];
-  const lower = text.toLowerCase();
+
+  // Apply stratification to reduce false positives from code/comments
+  const stratified = stratifyContent(text);
+  const lower = stratified.toLowerCase();
+
   const found = [];
   for (const [signal, keywords] of Object.entries(SIGNAL_KEYWORDS)) {
     for (const kw of keywords) {
