@@ -102,6 +102,19 @@ describe('recallVerifier.enqueuePublishedAsset', () => {
     assert.equal(verify[0].verification.reason, 'feature_disabled');
   });
 
+  // #136: verifier flipped from default-on (client-side fallback) to opt-in
+  // observability after Hub /a2a/fetch contract was confirmed strict (see
+  // EvoMap/evomap-hub#669). When EVOLVE_RECALL_VERIFY is unset, enqueue must
+  // skip with feature_disabled — not silently run.
+  it('is OFF by default when EVOLVE_RECALL_VERIFY is unset', () => {
+    delete process.env.EVOLVE_RECALL_VERIFY;
+    const rv = loadFresh();
+    rv._resetForTesting();
+    const r = rv.enqueuePublishedAsset({ asset_id: 'a1', type: 'Capsule', signals: [], publishedAt: Date.now() });
+    assert.equal(r.enqueued, false);
+    assert.equal(r.reason, 'feature_disabled');
+  });
+
   it('emits sample_rate when sample roll fails', () => {
     process.env.EVOLVE_RECALL_VERIFY_SAMPLE_RATE = '0';
     const rv = loadFresh();

@@ -140,8 +140,13 @@ describe('hookAdapter', () => {
         const destDir = path.join(tmp, 'hooks');
         const evolverRoot = path.resolve(__dirname, '..');
         const copied = hookAdapter.copyHookScripts(destDir, path.join(evolverRoot, 'src', 'adapters'));
-        // 3 hook entry points + _runtimePaths helper required by two of them.
-        assert.equal(copied.length, 4);
+        // 3 hook entry points + 2 helpers (`_runtimePaths.js`,
+        // `_memoryFiltering.js`) required by them via `require('./...')`.
+        // Helper list is verified separately by the "#547 — setup-hooks
+        // copies every helper required by the entry-point scripts" suite,
+        // which scans the actual `require` statements; this assertion is
+        // just a quick smoke test on count.
+        assert.equal(copied.length, 5);
         for (const f of copied) {
           assert.ok(fs.existsSync(f));
         }
@@ -897,6 +902,88 @@ describe('codex adapter', () => {
       const postCmds = merged.hooks.PostToolUse.map(h => h.command);
       assert.ok(postCmds.includes('node my-watcher.js'));
       assert.ok(postCmds.some(c => c.includes('evolver-signal-detect')));
+    } finally { cleanup(tmp); }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #547: setup-hooks must copy every helper required by the entry-point hooks
+//
+// Two regressions of this exact shape have shipped:
+//   - PR #94 review caught `_runtimePaths.js` missing from the copy list.
+//   - Issue #547 (rendigua, v1.87.0): `_memoryFiltering.js` was added to
+//     evolver-session-start.js but not to hookAdapter.js's copy list, so
+//     fresh installs crashed immediately with
+//     `Error: Cannot find module './_memoryFiltering'`.
+//
+// This test scans every `require('./_xxx')` in the source adapter scripts
+// and asserts the target file is present in `src/adapters/scripts/` AND
+// that an end-to-end `installHooks` actually copies it into the
+// destination dir. Any future helper added but forgotten in
+// hookAdapter.js's list will trip the assertion immediately.
+// ---------------------------------------------------------------------------
+describe('setup-hooks copies every helper required by the entry-point scripts (#547)', () => {
+  const scriptsDir = path.resolve(__dirname, '..', 'src', 'adapters', 'scripts');
+
+  function collectRelativeRequires() {
+    const entries = fs.readdirSync(scriptsDir).filter(f => f.endsWith('.js'));
+    const requires = new Set();
+    for (const entry of entries) {
+      const src = fs.readFileSync(path.join(scriptsDir, entry), 'utf8');
+      // Match `require('./foo')` and `require("./foo")` for any "./..."
+      // path that targets a sibling file (not a node_modules package).
+      const re = /require\(\s*['"](\.\/[^'"]+)['"]\s*\)/g;
+      let m;
+      while ((m = re.exec(src)) !== null) {
+        // Normalise: ensure .js suffix for matching against directory list.
+        let target = m[1].replace(/^\.\//, '');
+        if (!target.endsWith('.js')) target += '.js';
+        requires.add(target);
+      }
+    }
+    return [...requires];
+  }
+
+  it('every local require in adapter scripts points to a file that actually exists in scripts/', () => {
+    const requires = collectRelativeRequires();
+    assert.ok(requires.length > 0, 'expected at least one local require to verify');
+    const existingScripts = new Set(fs.readdirSync(scriptsDir));
+    for (const target of requires) {
+      assert.ok(existingScripts.has(target),
+        `adapter script requires './${target.replace(/\.js$/, '')}' but src/adapters/scripts/${target} does not exist`);
+    }
+  });
+
+  it('every required helper is copied by installHooks (Codex)', () => {
+    const requires = collectRelativeRequires();
+    const tmp = makeTmpDir();
+    try {
+      const platform = { id: 'codex', configRoot: tmp, hooksDir: path.join(tmp, '.codex', 'hooks') };
+      const evolverRoot = path.resolve(__dirname, '..', 'src', 'adapters');
+      hookAdapter.copyHookScripts(platform.hooksDir, evolverRoot);
+      const installed = new Set(fs.readdirSync(platform.hooksDir));
+      for (const target of requires) {
+        assert.ok(installed.has(target),
+          `evolver-session-*.js requires './${target.replace(/\.js$/, '')}' but setup-hooks did not copy ` +
+          `src/adapters/scripts/${target} into the destination dir (this was the root cause of #547)`);
+      }
+    } finally { cleanup(tmp); }
+  });
+
+  it('every helper copied by install is also removed by uninstall (no orphan files)', () => {
+    const requires = collectRelativeRequires();
+    const tmp = makeTmpDir();
+    try {
+      const hooksDir = path.join(tmp, '.codex', 'hooks');
+      const evolverRoot = path.resolve(__dirname, '..', 'src', 'adapters');
+      hookAdapter.copyHookScripts(hooksDir, evolverRoot);
+      hookAdapter.removeHookScripts(hooksDir);
+      // After uninstall, none of the required-helper files should remain.
+      const remaining = fs.existsSync(hooksDir) ? new Set(fs.readdirSync(hooksDir)) : new Set();
+      for (const target of requires) {
+        assert.ok(!remaining.has(target),
+          `setup-hooks --uninstall left orphan file ${target} (install copies it but uninstall does not remove it)`);
+      }
     } finally { cleanup(tmp); }
   });
 });

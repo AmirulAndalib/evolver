@@ -390,11 +390,11 @@ async function main() {
         // own env, since verification can run with HubMirror off (verifier
         // events are local-only on first ship).
         try {
-          const enabled = String(process.env.EVOLVE_RECALL_VERIFY || '1') !== '0';
+          const enabled = String(process.env.EVOLVE_RECALL_VERIFY || '0') === '1';
           const sampleRateRaw = Number(process.env.EVOLVE_RECALL_VERIFY_SAMPLE_RATE);
           const sampleRate = Number.isFinite(sampleRateRaw) && sampleRateRaw >= 0 && sampleRateRaw <= 1 ? sampleRateRaw : 1.0;
           if (!enabled) {
-            console.log('[RecallVerify] DISABLED — set EVOLVE_RECALL_VERIFY=1 to verify published assets round-trip via Hub Phase 2 lookup.');
+            console.log('[RecallVerify] DISABLED (default) — opt-in observability only. Set EVOLVE_RECALL_VERIFY=1 to verify published assets round-trip via Hub Phase 2 lookup.');
           } else {
             console.log(`[RecallVerify] ENABLED — verifying published assets via Hub Phase 2 lookup, sample_rate=${sampleRate}. Set EVOLVE_RECALL_VERIFY=0 to disable.`);
           }
@@ -451,7 +451,7 @@ async function main() {
         // RecallVerify worker: starts once per process; drains the publish-
         // verification queue with backoff. unref'd so it never blocks exit.
         try {
-          if (String(process.env.EVOLVE_RECALL_VERIFY || '1') !== '0') {
+          if (String(process.env.EVOLVE_RECALL_VERIFY || '0') === '1') {
             require('./src/gep/recallVerifier').startWorker();
           }
         } catch (rvStartErr) {

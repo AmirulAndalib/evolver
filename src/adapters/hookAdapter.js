@@ -153,12 +153,21 @@ function assertNotSymlink(p, label) {
 
 function copyHookScripts(destDir, evolverRoot) {
   const scriptsDir = path.join(evolverRoot || __dirname, 'scripts');
-  // _runtimePaths.js is required by the two session-* scripts via
-  // `require('./_runtimePaths')`, which resolves relative to the *destination*
-  // (__dirname after copy). It MUST be copied alongside or both hooks crash
-  // with MODULE_NOT_FOUND at runtime. Caught in PR #94 review.
+  // Every helper required by the entry-point hooks via `require('./_xxx')`
+  // resolves relative to the *destination* (`__dirname` after copy), so
+  // every such helper MUST appear here or the hook crashes with
+  // MODULE_NOT_FOUND at runtime. Two regressions of this shape have shipped
+  // already:
+  //   - PR #94 review caught `_runtimePaths.js` missing from this list.
+  //   - Issue #547 (rendigua, v1.87.0): `_memoryFiltering.js` was added to
+  //     evolver-session-start.js but not here, so fresh installs failed
+  //     immediately on `node .codex/hooks/evolver-session-start.js`.
+  // To keep future helpers from re-living this, the regression test in
+  // test/adapters.test.js scans every `require('./_*')` in the source
+  // adapter scripts and asserts the target file is in this list.
   const scripts = [
     '_runtimePaths.js',
+    '_memoryFiltering.js',
     'evolver-session-start.js',
     'evolver-signal-detect.js',
     'evolver-session-end.js',
@@ -235,8 +244,14 @@ function removeEvolverHooks(filePath, { markerKey = '_evolver_managed' } = {}) {
 }
 
 function removeHookScripts(hooksDir) {
+  // Must mirror the install list above. If install copies a helper but
+  // uninstall doesn't remove it, `setup-hooks --uninstall` leaves orphan
+  // files behind that the user then has to clean up by hand (#547 fix
+  // would have introduced exactly this gap if only the install side
+  // had been updated).
   const scripts = [
     '_runtimePaths.js',
+    '_memoryFiltering.js',
     'evolver-session-start.js',
     'evolver-signal-detect.js',
     'evolver-session-end.js',
