@@ -9,6 +9,35 @@ function envInt(key, fallback) {
   return isNaN(n) ? fallback : n;
 }
 
+// Strict variant for timing / timeout / interval values that must be
+// positive. Rejects: NaN (e.g. "5min" silently parses to 5 -- here 5 is
+// accepted but a suffix-only "ms" becomes NaN), 0 (which would turn an
+// interval into a hot loop or zero out a timeout signal), and negatives
+// (setTimeout clamps to 1 ms). Also rejects values >= 2^31 because
+// setTimeout silently downgrades those to 1 ms in Node. Misconfigured
+// values fall back to the default with a one-time warning so the user
+// is not silently running a broken setup.
+const _envPositiveIntWarned = new Set();
+function envPositiveInt(key, fallback) {
+  const v = process.env[key];
+  if (v === undefined || v === '') return fallback;
+  const n = parseInt(v, 10);
+  const valid = Number.isFinite(n) && n > 0 && n < 2 ** 31;
+  if (!valid) {
+    if (!_envPositiveIntWarned.has(key)) {
+      _envPositiveIntWarned.add(key);
+      try {
+        console.warn(
+          '[config] ' + key + '=' + JSON.stringify(v) + ' is not a positive integer; ' +
+          'falling back to ' + fallback + '. Set a value in (0, 2^31) ms.'
+        );
+      } catch (_) {}
+    }
+    return fallback;
+  }
+  return n;
+}
+
 function envFloat(key, fallback) {
   const v = process.env[key];
   if (v === undefined || v === '') return fallback;
@@ -23,14 +52,19 @@ function envStr(key, fallback) {
 
 // --- Network & A2A ---
 
-const HELLO_TIMEOUT_MS = envInt('EVOLVER_HELLO_TIMEOUT_MS', 15000);
-const HEARTBEAT_TIMEOUT_MS = envInt('EVOLVER_HEARTBEAT_TIMEOUT_MS', 10000);
-const HEARTBEAT_INTERVAL_MS = envInt('HEARTBEAT_INTERVAL_MS', 360000);
-const HEARTBEAT_FIRST_DELAY_MS = envInt('EVOLVER_HEARTBEAT_FIRST_DELAY_MS', 30000);
-const EVENT_POLL_TIMEOUT_MS = envInt('EVOLVER_EVENT_POLL_TIMEOUT_MS', 60000);
-const HTTP_TRANSPORT_TIMEOUT_MS = envInt('EVOLVER_HTTP_TRANSPORT_TIMEOUT_MS', 15000);
-const SECRET_CACHE_TTL_MS = envInt('EVOLVER_SECRET_CACHE_TTL_MS', 60000);
-const HUB_SEARCH_TIMEOUT_MS = envInt('EVOLVER_HUB_SEARCH_TIMEOUT_MS', 8000);
+// Hot-path timers / intervals use envPositiveInt: a misconfigured 0,
+// negative, or non-numeric value would otherwise turn the heartbeat
+// loop into a hot spin (setTimeout(0)) or zero out a timeout signal
+// (AbortSignal.timeout(0) immediately aborts every request). Falls back
+// to the default with a one-time warning when the env var is invalid.
+const HELLO_TIMEOUT_MS = envPositiveInt('EVOLVER_HELLO_TIMEOUT_MS', 15000);
+const HEARTBEAT_TIMEOUT_MS = envPositiveInt('EVOLVER_HEARTBEAT_TIMEOUT_MS', 10000);
+const HEARTBEAT_INTERVAL_MS = envPositiveInt('HEARTBEAT_INTERVAL_MS', 360000);
+const HEARTBEAT_FIRST_DELAY_MS = envPositiveInt('EVOLVER_HEARTBEAT_FIRST_DELAY_MS', 30000);
+const EVENT_POLL_TIMEOUT_MS = envPositiveInt('EVOLVER_EVENT_POLL_TIMEOUT_MS', 60000);
+const HTTP_TRANSPORT_TIMEOUT_MS = envPositiveInt('EVOLVER_HTTP_TRANSPORT_TIMEOUT_MS', 15000);
+const SECRET_CACHE_TTL_MS = envPositiveInt('EVOLVER_SECRET_CACHE_TTL_MS', 60000);
+const HUB_SEARCH_TIMEOUT_MS = envPositiveInt('EVOLVER_HUB_SEARCH_TIMEOUT_MS', 8000);
 
 // Hub URL resolution (since v1.69.7).
 //
@@ -234,6 +268,7 @@ module.exports = {
   VALIDATOR_BATCH_TIMEOUT_MS,
   // Helpers
   envInt,
+  envPositiveInt,
   envFloat,
   envStr,
 };

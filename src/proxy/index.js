@@ -547,7 +547,13 @@ class EvoMapProxy {
         headers: this.lifecycle._buildHeaders(),
         signal: AbortSignal.timeout(10_000),
       });
-      if (!res.ok) return { error: `Hub ${res.status}` };
+      if (!res.ok) {
+        // Drain body so undici can recycle the socket back to the pool.
+        // Without this, repeated non-ok responses leak pool slots and
+        // eventually starve the dispatcher.
+        try { res.body?.cancel?.().catch(() => {}); } catch {}
+        return { error: `Hub ${res.status}` };
+      }
       return res.json();
     } catch (err) {
       return { error: err.message };

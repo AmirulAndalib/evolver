@@ -255,10 +255,16 @@ let _daemonRunning = false;
 let _daemonInflight = false;
 let _daemonStats = { ticks: 0, processed: 0, lastError: null, lastRunAt: 0, preflight: null };
 let _preflightDisabled = false;
+// Generation counter: every poke / start bumps this. Tick captures
+// its gen at entry; if it doesn't match on resume, the tick refuses
+// to schedule its own next timer (a fresher path already owns it).
+// Mirrors the `_heartbeatGen` pattern in proxy/lifecycle/manager.js.
+let _daemonGen = 0;
 
 async function _daemonTick() {
   if (_daemonInflight) return;
   _daemonInflight = true;
+  const myGen = _daemonGen;
   try {
     if (!isValidatorEnabled()) {
       _daemonStats.ticks += 1;
@@ -284,8 +290,14 @@ async function _daemonTick() {
     console.warn('[ValidatorDaemon] tick failed (non-fatal): ' + _daemonStats.lastError);
   } finally {
     _daemonInflight = false;
-    if (_daemonRunning) {
+    // Generation guard: a poke or start fired while we were awaiting
+    // runValidatorCycle(). The fresher path already armed its own
+    // timer (T2); scheduling here would overwrite the T2 reference
+    // without clearing it, leaving two self-rearming chains running
+    // at doubled cadence.
+    if (_daemonRunning && myGen === _daemonGen) {
       _daemonTimer = setTimeout(_daemonTick, DAEMON_INTERVAL_MS);
+      if (_daemonTimer && typeof _daemonTimer.unref === 'function') _daemonTimer.unref();
     }
   }
 }
@@ -297,6 +309,7 @@ async function _daemonTick() {
 function startValidatorDaemon() {
   if (_daemonRunning) return false;
   _daemonRunning = true;
+  _daemonGen += 1;
   if (isValidatorEnabled()) {
     // Surface an explicit notice every time validator mode starts so that users
     // who do not read docs cannot later claim they were unaware the validator
@@ -314,6 +327,7 @@ function startValidatorDaemon() {
     _ensurePreflight();
   }
   _daemonTimer = setTimeout(_daemonTick, DAEMON_FIRST_DELAY_MS);
+  if (_daemonTimer && typeof _daemonTimer.unref === 'function') _daemonTimer.unref();
   return true;
 }
 
@@ -323,6 +337,36 @@ function stopValidatorDaemon() {
     clearTimeout(_daemonTimer);
     _daemonTimer = null;
   }
+}
+
+/**
+ * Force the daemon to fire its next tick immediately. The internal
+ * setTimeout runs on libuv's monotonic clock, which freezes during macOS
+ * sleep -- without a poke, the post-wake tick may be up to
+ * DAEMON_INTERVAL_MS (default 60s) away on the resumed clock, leaving
+ * the node "alive on heartbeat but functionally inert" for that window.
+ *
+ * Safe to call when the daemon is stopped (no-op) or when a tick is
+ * already in flight (the in-flight guard at _daemonTick / the running
+ * gate at the top of the function both protect against double-firing).
+ *
+ * Wired from the index.js SIGCONT handler so wake events fan out to the
+ * validator the same way they already do to heartbeat and SSE.
+ */
+function pokeValidatorDaemon() {
+  if (!_daemonRunning) return false;
+  if (_daemonTimer) {
+    clearTimeout(_daemonTimer);
+    _daemonTimer = null;
+  }
+  // Bump generation: any in-flight `_daemonTick` from before the
+  // poke will see its captured gen mismatch on resume and skip its
+  // tail-`setTimeout`, so we don't end up with two concurrent timers
+  // self-rearming at doubled cadence.
+  _daemonGen += 1;
+  _daemonTimer = setTimeout(_daemonTick, 0);
+  if (_daemonTimer && typeof _daemonTimer.unref === 'function') _daemonTimer.unref();
+  return true;
 }
 
 function getValidatorDaemonStats() {
@@ -355,6 +399,7 @@ module.exports = {
   isValidatorEnabled,
   startValidatorDaemon,
   stopValidatorDaemon,
+  pokeValidatorDaemon,
   getValidatorDaemonStats,
   _resetPreflightForTests,
   _setPreflightForTests,

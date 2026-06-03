@@ -249,8 +249,18 @@ if (!OPTS.skipObfuscate) {
     };
 
     const MAX_OBF_ATTEMPTS_RAW = process.env.OBF_MAX_ATTEMPTS;
+    // Default 12 (was 4). The obfuscator's new.target -> #target mangling is
+    // non-deterministic ACROSS PROCESSES, not just across seeds: the same seed
+    // + same input can pass in one node process and fail in another (Set
+    // iteration / internal-state timing). So perturbing the seed per attempt is
+    // not the real lever — re-running the obfuscate call is. The v1.87.4 deploy
+    // hit 4/4 consecutive failures with the default of 4 and aborted the npm
+    // publish + binary upload. At an observed per-attempt failure rate that can
+    // run well above the historical ~5% for some bundles, 4 retries is too few;
+    // 12 drives the all-fail probability to negligible while costing only extra
+    // attempts on the rare unlucky run. Override with OBF_MAX_ATTEMPTS.
     const MAX_OBF_ATTEMPTS = MAX_OBF_ATTEMPTS_RAW === undefined
-      ? 4
+      ? 12
       : parseInt(MAX_OBF_ATTEMPTS_RAW, 10);
     if (!Number.isInteger(MAX_OBF_ATTEMPTS) || MAX_OBF_ATTEMPTS < 1) {
       console.error(`  ERROR: OBF_MAX_ATTEMPTS must be a positive integer; got ${JSON.stringify(MAX_OBF_ATTEMPTS_RAW)}.`);

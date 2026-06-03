@@ -211,6 +211,45 @@ function eventsPath() { return path.join(getGepAssetsDir(), 'events.jsonl'); }
 function candidatesPath() { return path.join(getGepAssetsDir(), 'candidates.jsonl'); }
 function externalCandidatesPath() { return path.join(getGepAssetsDir(), 'external_candidates.jsonl'); }
 function failedCapsulesPath() { return path.join(getGepAssetsDir(), 'failed_capsules.json'); }
+function pendingSignalsPath() { return path.join(getGepAssetsDir(), 'pending_signals.json'); }
+
+// Explicit signal injection channel. A user (or an external tool) can declare
+// arbitrary signals out-of-band by writing
+//   { "signals": ["publish_markdown_to_feishu", ...], "note": "..." }
+// to <gep-assets-dir>/pending_signals.json (getGepAssetsDir(), default
+// .evolver/gep -- see #166). The signal-extraction stage reads these
+// once and injects them into the cycle's signal set, bypassing the closed
+// OPPORTUNITY_SIGNALS vocabulary that regex/keyword/LLM extraction is limited
+// to. This is how a human-verified, deterministic capability (whose intent no
+// extractor would ever map to a first-class signal) gets a chance to select
+// its dedicated Gene.
+//
+// Read-once semantics: the file is consumed (emptied to {signals:[]}) under a
+// file lock so the same explicit intent does not re-fire on every subsequent
+// cycle. Returns the array of signal strings that were pending (possibly []).
+function consumePendingSignals() {
+  const p = pendingSignalsPath();
+  if (!fs.existsSync(p)) return [];
+  return withFileLock(p, () => {
+    const data = readJsonIfExists(p, { signals: [] });
+    const raw = data && Array.isArray(data.signals) ? data.signals : [];
+    const signals = raw
+      .map(s => (typeof s === 'string' ? s.trim() : ''))
+      .filter(s => s.length > 0 && s.length <= 200);
+    // Consume whenever the file held any entries -- even if every entry was
+    // blank / over-length / non-string and none survived filtering. Otherwise
+    // a file like {signals:["  "]} is re-read (under lock) on every later
+    // cycle and read-once never completes. raw.length===0 means nothing to
+    // consume (no pending signals, an already-emptied file, or a malformed
+    // file that readJsonIfExists already warned about); skip the write to
+    // avoid needless churn and to preserve a corrupt file for the user to fix.
+    if (raw.length > 0) {
+      // Consume: leave an empty, well-formed file so the next cycle is a no-op.
+      writeJsonAtomic(p, { signals: [], note: '' });
+    }
+    return signals;
+  });
+}
 
 const LEGACY_RUNTIME_FILENAMES = [
   'genes.json',
@@ -676,6 +715,7 @@ module.exports = {
   upsertGene, appendCapsule, upsertCapsule,
   appendFailedCapsule, readRecentFailedCapsules,
   genesPath, capsulesPath, eventsPath, candidatesPath, externalCandidatesPath, failedCapsulesPath,
+  pendingSignalsPath, consumePendingSignals,
   genesSeedPath, bundledGenesPath, ensureGenesSeeded, migrateLegacyRuntimeAssets,
   ensureAssetFiles, buildValidationCmd,
   withFileLock,

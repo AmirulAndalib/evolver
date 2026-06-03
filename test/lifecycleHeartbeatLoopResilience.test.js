@@ -218,9 +218,10 @@ test('pokeHeartbeatLoop clears the pending timer and resets consecutive failures
   assert.strictEqual(mgr._consecutiveFailures, 0);
   assert.ok(mgr._heartbeatTimer, 'poke must arm a fresh 0ms timer');
 
-  // Drain microtasks so the 0ms tick fires.
-  await new Promise((resolve) => setImmediate(resolve));
-  await new Promise((resolve) => setImmediate(resolve));
+  // The poke schedules with setTimeout(fn, 0). setImmediate vs setTimeout(0)
+  // ordering is non-deterministic in Node, so wait briefly on real wall clock
+  // for the timer queue to drain rather than racing with setImmediate.
+  await new Promise((resolve) => setTimeout(resolve, 20));
 
   assert.ok(heartbeatCalls >= 1, `heartbeat must run promptly on poke (saw ${heartbeatCalls})`);
 

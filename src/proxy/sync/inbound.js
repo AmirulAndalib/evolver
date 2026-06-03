@@ -83,12 +83,25 @@ class InboundSync {
 
     try {
       const senderId = this.store.getState('node_id');
-      await hubFetch(endpoint, {
+      // Round-8 (§21.5): drain the response body so the undici long-poll
+      // dispatcher pool is not leaked one socket per ack. ackDelivered
+      // is called every inbound poll cycle (default 1-10s); the
+      // pre-round-8 code captured no reference to res and never called
+      // .json()/.text()/body.cancel(), so each ack pinned a socket
+      // until GC. After a few minutes of activity the strict-pool was
+      // exhausted and proxy-mode heartbeats hung on next acquire --
+      // matches the "alive once then dead" user symptom in proxy mode.
+      const res = await hubFetch(endpoint, {
         method: 'POST',
         headers: this.getHeaders(),
         body: JSON.stringify({ sender_id: senderId, message_ids: delivered.map(m => m.id) }),
         signal: AbortSignal.timeout(10_000),
       });
+      try {
+        if (res && res.body && typeof res.body.cancel === 'function') {
+          await res.body.cancel().catch(() => {});
+        }
+      } catch (_) { /* never escape the drain helper */ }
       return { acked: delivered.length };
     } catch (err) {
       this.logger.error(`[inbound] ack failed: ${err.message}`);

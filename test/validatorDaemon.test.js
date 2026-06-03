@@ -88,6 +88,71 @@ describe('validator daemon', function () {
     assert.equal(fetchCalls, 0, 'no hub calls when disabled');
   });
 
+  it('poke mid-tick does not fork the timer chain (generation guard)', async function () {
+    // Regression for the P2 bug where pokeValidatorDaemon would arm a new
+    // timer (T2) while a tick was awaiting the hub, and the in-flight
+    // tick's finally would then overwrite _daemonTimer from T2 -> T3
+    // without clearTimeout(T2). Both T2 and T3 would then fire, leaking
+    // timers and doubling cadence on every poke.
+    //
+    // Strategy: pick an interval short enough that a leaked chain will
+    // fire visibly within the test window. With the bug, after the
+    // poked tick #2 completes, BOTH the leaked T3 (from tick #1's
+    // finally) and the freshly-armed T3' (from tick #2's finally) will
+    // fire within DAEMON_INTERVAL_MS, producing fetchCount >= 4 in a
+    // window of (interval + slack). With the fix, only ONE timer chain
+    // exists, so fetchCount === 3 (tick #1 + poked #2 + scheduled #3).
+    process.env.EVOLVER_VALIDATOR_ENABLED = '1';
+    process.env.EVOLVER_VALIDATOR_DAEMON_INTERVAL_MS = '15000';
+    process.env.EVOLVER_VALIDATOR_DAEMON_FIRST_DELAY_MS = '0';
+
+    let inflightResolve;
+    const inflightStarted = new Promise((r) => { inflightResolve = r; });
+    let releaseFetch;
+    const fetchGate = new Promise((r) => { releaseFetch = r; });
+    let fetchCount = 0;
+    const fetchImpl = async (url) => {
+      if (url.endsWith('/a2a/validator/stake')) return mkRes({ stake: { stake_amount: 100 } });
+      if (url.endsWith('/a2a/fetch')) {
+        fetchCount += 1;
+        if (fetchCount === 1) {
+          // Signal that tick #1 is now awaiting and block until we poke.
+          inflightResolve();
+          await fetchGate;
+        }
+        return mkRes({ validation_tasks: [] });
+      }
+      return mkRes({});
+    };
+
+    await withFakeFetch(fetchImpl, async () => {
+      const v = freshRequire('../src/gep/validator');
+      v.startValidatorDaemon();
+      // Wait for tick #1 to enter the awaiting state.
+      await inflightStarted;
+      // Poke while tick #1 is in flight -- this arms T2 (0ms).
+      assert.equal(v.pokeValidatorDaemon(), true);
+      // Release tick #1; its finally must NOT arm an extra 15s timer.
+      releaseFetch();
+      // Wait long enough for: tick #1 to finish, T2 to fire (~0ms), tick
+      // #2 to complete (~100ms), and the next 15s timer to fire ONCE
+      // (~15s after tick #2). Use 15.5s to cover scheduling slack.
+      await new Promise((r) => setTimeout(r, 15500));
+      v.stopValidatorDaemon();
+      // With the generation guard fix:
+      //   fetchCount === 3 (tick #1 + tick #2 from poke + tick #3 from
+      //   tick #2's re-arm).
+      // Without the fix, tick #1's finally would arm a second 15s timer
+      // *in addition to* T2, and after T2 runs and re-arms its own 15s
+      // timer there would be TWO 15s timers firing in this window,
+      // producing fetchCount === 4.
+      assert.equal(
+        fetchCount, 3,
+        'expected 3 fetches (no forked chain), got ' + fetchCount
+      );
+    });
+  });
+
   it('processes tasks on tick when enabled', async function () {
     process.env.EVOLVER_VALIDATOR_ENABLED = '1';
     let fetchCount = 0;

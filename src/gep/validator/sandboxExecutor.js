@@ -134,13 +134,22 @@ function truncate(str, limit) {
 }
 
 function createSandboxDir() {
+  // NOTE(windows): mode 0o700 is silently ignored on Windows. The sandbox
+  // directory is NOT access-restricted on Windows; rely on OS user isolation
+  // instead. This cannot be fully mitigated via fs.mkdirSync options alone.
   const base = path.join(os.tmpdir(), 'evolver-validator');
   if (!fs.existsSync(base)) {
     fs.mkdirSync(base, { recursive: true, mode: 0o700 });
   }
   const name = 'task_' + Date.now().toString(36) + '_' + crypto.randomBytes(4).toString('hex');
   const dir = path.join(base, name);
-  fs.mkdirSync(dir, { mode: 0o700 });
+  // Wrap in try/catch: mkdirSync without recursive:true throws if the parent
+  // has a permission problem (e.g. read-only tmpdir on constrained hosts).
+  try {
+    fs.mkdirSync(dir, { mode: 0o700 });
+  } catch (e) {
+    throw new Error('[sandboxExecutor] Failed to create sandbox dir ' + dir + ': ' + (e && e.message || e));
+  }
   return dir;
 }
 

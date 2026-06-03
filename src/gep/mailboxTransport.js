@@ -3,6 +3,39 @@
 const http = require('http');
 const { getProxyUrl, getProxyToken } = require('../proxy/server/settings');
 
+// Bounded keep-alive agent. Default `agent: undefined` would use Node's
+// global `http.globalAgent` whose default keep-alive timeout is 8 seconds
+// AND survives macOS sleep on libuv's monotonic clock. After the laptop
+// resumes, the next request reuses a socket the proxy / local OS has
+// already closed and only fails after `timeout: 10_000` -- enough time
+// for the proxy-mode heartbeat to look stalled.
+//
+// Round-6 (§19.8): the previous value was 1000ms keepAliveMsecs, which
+// was wrong for two reasons:
+//   1. NAT eviction in residential / corporate networks is 300-900s,
+//      not 1s. The 1s window was cargo-culted from browser keep-alive
+//      defaults and gives zero real NAT-eviction protection for the
+//      proxy is on localhost (NAT does not apply).
+//   2. A 1s window forces a fresh TCP+TLS handshake on every request
+//      that lands >=1s after the previous one, which is essentially
+//      every request in steady state -- adding 10-50ms per call for
+//      no gain. Locally the proxy is the only consumer; the real
+//      sleep/wake risk is covered by the explicit
+//      drainPool/wake-recovery path on the undici agent used for hub
+//      traffic, NOT this localhost agent.
+// 30s window balances:
+//   - keep-alive reuse for legitimate proxy-mode bursts (proxy clients
+//     issue heartbeat + mailbox poll + receive within sub-second)
+//   - guarantees a fresh socket post-wake (longer-than-30s sleep ->
+//     pool is empty by definition; shorter sleep -> proxy on
+//     localhost would not have lost the socket anyway)
+const _proxyAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 16,
+  maxFreeSockets: 4,
+});
+
 function _request(method, path, body) {
   const proxyUrl = getProxyUrl();
   if (!proxyUrl) {
@@ -27,6 +60,7 @@ function _request(method, path, body) {
         method,
         headers,
         timeout: 10_000,
+        agent: _proxyAgent,
       },
       (res) => {
         const chunks = [];

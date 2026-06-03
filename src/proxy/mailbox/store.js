@@ -68,6 +68,27 @@ function safeParse(payload) {
   try { return JSON.parse(payload); } catch { return payload; }
 }
 
+// Round-9: the round-8 cross-process append lock (§21.7) was REMOVED.
+// Its premise -- that fs.appendFileSync to a regular file can interleave
+// bytes mid-line unless each write stays under PIPE_BUF (512 B darwin,
+// 4096 B linux) -- conflated two different POSIX guarantees. PIPE_BUF
+// atomicity is defined for PIPES/FIFOs, not regular files. A single
+// O_APPEND write() to a regular file is positioned atomically at EOF and
+// is not interleaved with other appenders on the local filesystems evolver
+// uses (~/.evomap); this was verified empirically on darwin/APFS --
+// concurrent 4 KB..1 MB appends from 6 writers produced zero torn lines.
+// So the lock guarded a non-problem. Worse, its 5 s deadline with a
+// busy-wait (Atomics.wait, then a spin-loop fallback) ran on the single
+// JS thread, so under any real contention it BLOCKED the event loop --
+// starving the very heartbeat/SSE/HTTP it shared the process with, i.e.
+// it could itself produce the "process alive but inert" symptom it claimed
+// to prevent. fs.appendFileSync writes the whole buffer with O_APPEND, so
+// a single record lands as one atomic append.
+//
+// Windows note: PIPE_BUF is a POSIX concept; it does not exist on Windows.
+// Windows NTFS provides the same atomicity guarantee for O_APPEND writes to
+// regular files that POSIX local filesystems do, so the removal above is
+// equally valid on Windows. No platform-specific code is needed here.
 function appendLine(filePath, obj) {
   fs.appendFileSync(filePath, JSON.stringify(obj) + '\n', 'utf8');
 }
@@ -135,8 +156,27 @@ class MailboxStore {
   _persistState() {
     const dir = path.dirname(this._stateFile);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const tmp = `${this._stateFile}.tmp`;
+    // Round-7 (§20.5): per-PID tmp path. Two evolver processes (daemon +
+    // ad-hoc CLI / proxy + loop) writing to the same `${stateFile}.tmp`
+    // would otherwise interleave: process B's writeFileSync truncates
+    // A's tmp mid-write, then B's rename completes with B's truncated
+    // payload as the final state.json. `state.json` holds the cached
+    // node_secret after a hub rotation -- a torn write here is the
+    // load-bearing trigger for the "401-loop -> reauth backoff -> dead
+    // for 30 min..4 h" symptom this branch targets. Matches the
+    // precedent set by _persistNodeSecret in src/gep/a2aProtocol.js.
+    const tmp = `${this._stateFile}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(this._state, null, 2) + '\n', 'utf8');
+    // Windows: fs.renameSync throws EPERM when the destination file already
+    // exists, unlike POSIX where rename(2) atomically replaces the target.
+    // Remove the destination first so the rename succeeds on all platforms.
+    // The window between unlink and rename is intentionally tiny; a crash in
+    // that window leaves the tmp file behind (recovered on next _persistState).
+    if (process.platform === 'win32') {
+      try { fs.unlinkSync(this._stateFile); } catch (e) {
+        if (e.code !== 'ENOENT') throw e;
+      }
+    }
     fs.renameSync(tmp, this._stateFile);
   }
 
@@ -384,7 +424,10 @@ class MailboxStore {
   // --- Compaction (reduces JSONL file size by rewriting only current state) ---
 
   compact() {
-    const tmpFile = this._messagesFile + '.tmp';
+    // Round-7 (§20.5): same per-PID tmp rationale as _persistState.
+    // Two concurrent compact() calls (daemon + ad-hoc CLI) racing on
+    // the same `${messagesFile}.tmp` lose the loser's compacted log.
+    const tmpFile = `${this._messagesFile}.${process.pid}.tmp`;
     const entries = [];
     for (const [, msg] of this._messages) {
       entries.push(msg);
@@ -396,6 +439,13 @@ class MailboxStore {
       fs.writeSync(fd, JSON.stringify(msg) + '\n');
     }
     fs.closeSync(fd);
+    // Windows: renameSync throws EPERM when the destination already exists.
+    // Remove it first so the swap succeeds on all platforms.
+    if (process.platform === 'win32') {
+      try { fs.unlinkSync(this._messagesFile); } catch (e) {
+        if (e.code !== 'ENOENT') throw e;
+      }
+    }
     fs.renameSync(tmpFile, this._messagesFile);
     this._rebuildIndex();
   }

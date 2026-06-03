@@ -207,7 +207,14 @@ function getAgentSessionsDir() {
   }
   if (!agentName) agentName = process.env.AGENT_NAME || 'main';
 
-  const home = process.env.HOME || process.env.USERPROFILE || '';
+  // Honor an explicit HOME override (used by tests to redirect to a fake
+  // home) before falling back to os.homedir(). On POSIX, os.homedir() also
+  // reads $HOME first, so this is a no-op in practice on macOS/Linux. On
+  // Windows, os.homedir() reads %USERPROFILE% and ignores HOME -- without
+  // this fallback, test/paths.test.js cannot inject a fake home and the
+  // tests fail with C:\Users\... vs the test's \tmp\home\... expectation.
+  // Same pattern as the reset-local-secret fix in eb423dc.
+  const home = process.env.HOME || os.homedir();
   return path.join(home, '.openclaw', 'agents', agentName, 'sessions');
 }
 
@@ -359,6 +366,12 @@ function _writeWorkspaceIdToFs(file, id) {
     // follow a symlink that appears between the lstat and open. Both
     // flags exist on Linux/macOS; on Windows O_NOFOLLOW is silently
     // ignored, but Windows has no symlink-by-default risk.
+    // NOTE(windows): mode 0o600 passed to openSync is silently ignored on
+    // Windows. The workspace-id file will NOT be restricted to owner-read-only.
+    // Only Windows user-profile directory ACLs provide isolation. To get
+    // proper per-user encryption on Windows, install @napi-rs/keyring — the
+    // keychain path above will store the id in Credential Manager (DPAPI)
+    // instead of this plaintext file.
     const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL |
       (fs.constants.O_NOFOLLOW || 0);
     let fd;
@@ -377,7 +390,8 @@ function _writeWorkspaceIdToFs(file, id) {
     } finally {
       fs.closeSync(fd);
     }
-    try { fs.chmodSync(file, 0o600); } catch { /* best-effort */ }
+    // Best-effort chmod: silently ignored on Windows (no equivalent ACL API).
+    try { fs.chmodSync(file, 0o600); } catch { /* best-effort; no-op on Windows */ }
     return payload;
   } catch {
     return null;

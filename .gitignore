@@ -1,5 +1,9 @@
 node_modules/
 .env
+# This repo is npm-canonical: only package-lock.json is tracked. A stray
+# pnpm-lock.yaml from a local `pnpm install` would diverge from CI's npm
+# install and silently feed mismatched dependencies into local dev.
+pnpm-lock.yaml
 memory/
 workspace/
 .evolver/
@@ -32,6 +36,9 @@ TRIAGE.md
 # Always per-machine, never committed.
 .evolver.lock
 .claude-worktrees/
+# Internal Claude working documents — contain local paths and audit notes not
+# intended for the public repo. Prefix matches the project convention in CLAUDE.md.
+claude-*.md
 
 # Singleton pid file written by `--loop` daemon to enforce one-instance-per-repo.
 # Per-machine, always recreated on launch.

@@ -146,7 +146,7 @@ describe('solidify() integration', () => {
     a2aProtocol = require('../src/gep/a2aProtocol');
     // Reset module-level flag so HUB_DRY_RUN warning fires on first call
     // regardless of which test file ran before this one in the same process.
-    a2aProtocol._resetDryRunWarnedForTesting();
+    a2aProtocol._testing._resetDryRunWarnedForTesting();
   });
 
   after(teardownTmpRepo);

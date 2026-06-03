@@ -47,7 +47,7 @@ describe('load backoff hardening (#446 Android/Termux 0 CPU)', () => {
     assert.ok(load.load15m <= 8);
   });
 
-  it('getSystemLoad preserves normal loadavg values on a healthy host', () => {
+  it('getSystemLoad preserves normal loadavg values on a healthy host', { skip: process.platform === 'win32' ? 'getSystemLoad routes Windows through _sampleWindowsCpuLoad() (process.cpuUsage delta) instead of os.loadavg, because Win32 returns [0,0,0] there. The os.loadavg mock this test installs is therefore bypassed and the assertion compares the CPU-sample fallback against 0.5. The Windows code path has its own semantics that need a separate test mocking process.cpuUsage + Date.now, not this one.' : false }, () => {
     os.cpus = () => new Array(8).fill({});
     os.loadavg = () => [0.5, 0.7, 0.9];
     const load = evolve.getSystemLoad();

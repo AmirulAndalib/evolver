@@ -84,7 +84,12 @@ describe('executeForceUpdate: keep-list preserves user config files', () => {
     populateFakeInstall(installRoot);
 
     const { executeForceUpdate } = freshRequireForceUpdate(makeSuccessfulDegit('999.999.999'));
-    const result = executeForceUpdate({ required_version: '>=1.0.0' });
+    // Match the stub's degit-returned version exactly: the version check in
+    // src/forceUpdate.js is now `===` (no range matching) to prevent a
+    // compromised hub from coercing an install with a permissive range like
+    // '>=0.0.1'. The earlier '>=1.0.0' form encoded the pre-tightening
+    // contract.
+    const result = executeForceUpdate({ required_version: '999.999.999' });
 
     assert.equal(result, true, 'update should succeed');
 

@@ -24,8 +24,8 @@ const {
   mergeAndCap,
   httpTransportSend,
   httpTransportReceive,
-  _resetDryRunWarnedForTesting,
 } = require('../src/gep/a2aProtocol');
+const { _resetDryRunWarnedForTesting } = require('../src/gep/a2aProtocol')._testing;
 const { computeAssetId } = require('../src/gep/contentHash');
 
 describe('protocol constants', () => {

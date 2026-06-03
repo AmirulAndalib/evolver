@@ -189,7 +189,9 @@ function copyHookScripts(destDir, evolverRoot) {
     // closes the per-file hole.
     assertNotSymlink(dest, `hook destination ${name}`);
     fs.copyFileSync(src, dest);
-    try { fs.chmodSync(dest, 0o755); } catch { /* windows */ }
+    // NOTE(windows): fs.chmodSync is a no-op on Windows; hook scripts remain
+    // executable via file extension association (.js), not Unix mode bits.
+    try { fs.chmodSync(dest, 0o755); } catch { /* best-effort; no-op on Windows */ }
     copied.push(dest);
   }
   return copied;

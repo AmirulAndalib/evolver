@@ -26,7 +26,9 @@ require.cache[forceUpdatePath] = {
   },
 };
 
-const { sendHeartbeat, _resetForceUpdateStateForTesting } = require('../src/gep/a2aProtocol');
+const a2aProtocol = require('../src/gep/a2aProtocol');
+const { sendHeartbeat } = a2aProtocol;
+const { _resetForceUpdateStateForTesting } = a2aProtocol._testing;
 
 describe('heartbeat-triggered force_update', () => {
   var tmpDir;

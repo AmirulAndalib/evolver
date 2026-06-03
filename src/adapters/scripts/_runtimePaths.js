@@ -59,12 +59,36 @@ function findEvolverRoot() {
   // `evolver-session-start.js`'s `additionalContext`. Restrict to trusted,
   // user/system-scoped install roots.
   try {
+    // Windows: `npm install -g` puts packages under %APPDATA%\npm\node_modules
+    // (most common), %ProgramFiles%\nodejs\node_modules (system-wide installer),
+    // or %ProgramFiles(x86)%\nodejs\node_modules. Build the extra Windows paths
+    // conditionally so the POSIX base list stays intact.
+    const _winPaths = process.platform === 'win32'
+      ? [
+          path.join(
+            process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'),
+            'npm', 'node_modules'
+          ),
+          ...(process.env.ProgramFiles
+            ? [path.join(process.env.ProgramFiles, 'nodejs', 'node_modules')]
+            : []),
+          ...(process.env['ProgramFiles(x86)']
+            ? [path.join(process.env['ProgramFiles(x86)'], 'nodejs', 'node_modules')]
+            : []),
+        ]
+      : [];
+
     const pkgJson = require.resolve('@evomap/evolver/package.json', {
+      // Do NOT include process.cwd() — a hostile workspace can plant its own
+      // node_modules/@evomap/evolver to gain control over the memory graph path
+      // (prompt-injection surface: evolver-session-start.js additionalContext).
+      // Only trust user/system-scoped install roots.
       paths: [
         path.join(os.homedir(), '.npm-global', 'lib', 'node_modules'),
         path.join(os.homedir(), '.local', 'lib', 'node_modules'),
         '/usr/lib/node_modules',
         '/usr/local/lib/node_modules',
+        ..._winPaths,
       ],
     });
     if (pkgJson && isEvolverPackageJson(pkgJson)) {

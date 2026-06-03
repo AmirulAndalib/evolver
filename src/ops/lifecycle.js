@@ -5,6 +5,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { execSync, spawn } = require('child_process');
 // 10 MB — prevents RangeError on large child process output (e.g. git log/diff
 // on large repos). See GHSA reports / issue #451.
@@ -121,12 +122,16 @@ function start(options) {
     var err = fs.openSync(LOG_FILE, 'a');
 
     var env = Object.assign({}, process.env);
-    var npmGlobal = path.join(process.env.HOME || '', '.npm-global/bin');
-    if (env.PATH && !env.PATH.includes(npmGlobal)) {
-        env.PATH = npmGlobal + ':' + env.PATH;
+    // .npm-global/bin is a Unix-only convention; skip the PATH injection on Windows
+    // to avoid polluting the environment with a path that does not exist.
+    if (process.platform !== 'win32') {
+        var npmGlobal = path.join(os.homedir(), '.npm-global', 'bin');
+        if (env.PATH && !env.PATH.includes(npmGlobal)) {
+            env.PATH = npmGlobal + ':' + env.PATH;
+        }
     }
 
-    var child = spawn('node', [script, '--loop'], {
+    var child = spawn(process.execPath, [script, '--loop'], {
         detached: true, stdio: ['ignore', out, err], cwd: WORKSPACE_ROOT, env: env
     });
     child.unref();
@@ -139,7 +144,9 @@ function stop() {
     var pids = getRunningPids();
     if (pids.length === 0) {
         console.log('[Lifecycle] No running evolver loops found.');
-        if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE);
+        // Wrap in try/catch: on Windows a concurrently-open file raises EBUSY
+        // instead of succeeding silently as on Unix.
+        try { if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE); } catch (_) {}
         return { status: 'not_running' };
     }
     for (var i = 0; i < pids.length; i++) {
@@ -153,12 +160,19 @@ function stop() {
     }
     var remaining = getRunningPids();
     for (var j = 0; j < remaining.length; j++) {
-        console.log('[Lifecycle] SIGKILL PID ' + remaining[j]);
-        try { process.kill(remaining[j], 'SIGKILL'); } catch (e) {}
+        console.log('[Lifecycle] Force-killing PID ' + remaining[j]);
+        // Windows does not support SIGKILL; use taskkill /F instead.
+        if (process.platform === 'win32') {
+            try { execSync('taskkill /F /PID ' + remaining[j], { stdio: 'ignore' }); } catch (e) {}
+        } else {
+            try { process.kill(remaining[j], 'SIGKILL'); } catch (e) {}
+        }
     }
-    if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE);
+    // Wrap in try/catch: on Windows a just-killed process may still hold its
+    // file handles open for a brief moment, causing EBUSY on unlinkSync.
+    try { if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE); } catch (_) {}
     var evolverLock = path.join(getRepoRoot(), 'evolver.pid');
-    if (fs.existsSync(evolverLock)) fs.unlinkSync(evolverLock);
+    try { if (fs.existsSync(evolverLock)) fs.unlinkSync(evolverLock); } catch (_) {}
     console.log('[Lifecycle] All stopped.');
     return { status: 'stopped', killed: pids };
 }
@@ -239,7 +253,62 @@ if (require.main === module) {
             console.log(JSON.stringify(health, null, 2));
             if (!health.healthy) { console.log('[Lifecycle] Restarting...'); restart(); }
             break;
-        default: console.log('Usage: node lifecycle.js [start|stop|restart|status|log|check]');
+        // watch: continuous self-healing supervisor loop. Checks every
+        // EVOLVER_WATCH_INTERVAL_S seconds (default 120) and restarts the
+        // daemon if checkHealth() reports unhealthy (not running or log
+        // stagnation beyond MAX_SILENCE_MS). Designed to be run as a
+        // lightweight companion process or cron job so the daemon self-heals
+        // without an external supervisor like pm2/launchd.
+        //
+        // Usage:
+        //   node src/ops/lifecycle.js watch          # runs until killed
+        //   node src/ops/lifecycle.js watch --once   # one check then exit
+        case 'watch':
+            var watchOnce = process.argv.slice(3).includes('--once');
+            var watchIntervalMs = (parseInt(process.env.EVOLVER_WATCH_INTERVAL_S || '120', 10) || 120) * 1000;
+            var prevWall = Date.now();
+            var prevMono = process.hrtime.bigint();
+            var skippedLastTick = false;
+            var watchRun = function () {
+                try {
+                    var nowWall = Date.now();
+                    var nowMono = process.hrtime.bigint();
+                    var wallDelta = nowWall - prevWall;
+                    var monoDeltaMs = Number((nowMono - prevMono) / 1000000n);
+                    // Wall-clock can jump forward after macOS sleep/resume; monotonic
+                    // clock does not. If the gap exceeds 60s, skip the stagnation
+                    // restart this tick to give the daemon a grace period — but only
+                    // once in a row, so a genuinely stuck daemon still gets restarted.
+                    var clockJumped = (wallDelta - monoDeltaMs) > 60000 && !skippedLastTick;
+                    var wh = checkHealth();
+                    var ts = new Date().toISOString();
+                    if (wh.healthy) {
+                        console.log('[Watch] ' + ts + ' healthy pids=' + (wh.pids || []).join(','));
+                        skippedLastTick = false;
+                    } else if (clockJumped && wh.reason === 'stagnation') {
+                        console.log('[watch] wall-clock jump detected (+' + Math.round((wallDelta - monoDeltaMs) / 1000) + 's), skipping stagnation check this cycle to give daemon a grace period');
+                        skippedLastTick = true;
+                    } else {
+                        console.log('[Watch] ' + ts + ' unhealthy reason=' + wh.reason + ' restarting...');
+                        var res = restart();
+                        console.log('[Watch] restart result: ' + JSON.stringify(res));
+                        skippedLastTick = false;
+                    }
+                    prevWall = nowWall;
+                    prevMono = nowMono;
+                } catch (e) {
+                    console.error('[watch] tick error: ' + (e && e.stack || e));
+                }
+            };
+            try { watchRun(); } catch (e) { console.error('[watch] tick error: ' + (e && e.stack || e)); }
+            if (!watchOnce) {
+                setInterval(function () {
+                    try { watchRun(); } catch (e) { console.error('[watch] tick error: ' + (e && e.stack || e)); }
+                }, watchIntervalMs);
+                console.log('[Watch] Supervisor running every ' + Math.round(watchIntervalMs / 1000) + 's. Ctrl-C to stop.');
+            }
+            break;
+        default: console.log('Usage: node lifecycle.js [start|stop|restart|status|log|check|watch]');
     }
 }
 

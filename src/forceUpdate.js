@@ -41,22 +41,14 @@ function executeForceUpdate(forceUpdate) {
     return false;
   }
 
-  const requiredVersion = String(forceUpdate.required_version || '').replace(/^>=/, '');
-  console.log('[ForceUpdate] Starting multi-channel update (target: >=' + requiredVersion +
+  const requiredVersion = String(forceUpdate.required_version || '').replace(/^[>=^~\s]+/, '');
+  if (!/^\d+\.\d+\.\d+(-[\w.]+)?(\+[\w.]+)?$/.test(requiredVersion)) {
+    console.warn('[ForceUpdate] Refusing — required_version "' + requiredVersion + '" is not a concrete semver (ranges not accepted).');
+    return false;
+  }
+  console.log('[ForceUpdate] Starting update (target: ' + requiredVersion +
     ', install root: ' + INSTALL_ROOT + ')');
 
-  function parseVer(v) {
-    var m = String(v || '').match(/(\d+)\.(\d+)\.(\d+)/);
-    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : [0, 0, 0];
-  }
-  function isAtLeast(current, required) {
-    var c = parseVer(current), r = parseVer(required);
-    for (var i = 0; i < 3; i++) {
-      if (c[i] > r[i]) return true;
-      if (c[i] < r[i]) return false;
-    }
-    return true;
-  }
   function getCurrentVersion() {
     try {
       var pkg = JSON.parse(fs.readFileSync(path.join(INSTALL_ROOT, 'package.json'), 'utf8'));
@@ -67,19 +59,24 @@ function executeForceUpdate(forceUpdate) {
   // Use os.tmpdir() for staging — INSTALL_ROOT's parent (e.g.
   // /usr/lib/node_modules/@evomap when globally installed) is often not
   // writable, unlike the previous user-project parent.
-  const TMP_TARGET = path.join(os.tmpdir(), '.evolver-update-tmp-' + process.pid);
+  // mkdtempSync produces a random suffix, preventing predictable-path pre-population.
+  const TMP_TARGET = fs.mkdtempSync(path.join(os.tmpdir(), '.evolver-update-tmp-'));
 
-  // Channel 1: GitHub Release (via degit)
+  // Channel 1: GitHub Release (via degit pinned to exact version tag)
   try {
-    console.log('[ForceUpdate] Channel 1: GitHub Release download...');
-    try { fs.rmSync(TMP_TARGET, { recursive: true, force: true }); } catch (_) {}
+    console.log('[ForceUpdate] Channel 1: GitHub Release download (v' + requiredVersion + ')...');
     var npxBin = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-    execFileSync(npxBin, ['-y', 'degit', 'EvoMap/evolver', TMP_TARGET], {
+    // Pin to exact git tag so we download a specific published release, not
+    // whatever is currently at HEAD (which could be a different, unreviewed commit).
+    // --force: mkdtempSync pre-creates TMP_TARGET; some degit versions refuse a pre-existing dest.
+    execFileSync(npxBin, ['-y', 'degit', '--force', 'EvoMap/evolver#v' + requiredVersion, TMP_TARGET], {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 60000, windowsHide: true, maxBuffer: MAX_EXEC_BUFFER,
     });
     var tmpPkg = JSON.parse(fs.readFileSync(path.join(TMP_TARGET, 'package.json'), 'utf8'));
-    if (tmpPkg.version && isAtLeast(tmpPkg.version, requiredVersion)) {
+    // Require exact version match — a ">=" check would allow a compromised hub to
+    // request version "0.0.1" and install any version including unreleased HEAD code.
+    if (tmpPkg.version && tmpPkg.version === requiredVersion) {
       var entries = fs.readdirSync(INSTALL_ROOT, { withFileTypes: true });
       for (var ei = 0; ei < entries.length; ei++) {
         var eName = entries[ei].name;
@@ -91,7 +88,28 @@ function executeForceUpdate(forceUpdate) {
       for (var ni = 0; ni < newEntries.length; ni++) {
         var src = path.join(TMP_TARGET, newEntries[ni].name);
         var dst = path.join(INSTALL_ROOT, newEntries[ni].name);
-        fs.cpSync(src, dst, { recursive: true });
+        // On Windows, files held open by antivirus or the OS itself raise EPERM/EBUSY.
+        // Retry up to 3 times with a short delay before propagating the error.
+        var copyErr = null;
+        for (var attempt = 0; attempt < 3; attempt++) {
+          try {
+            fs.cpSync(src, dst, { recursive: true });
+            copyErr = null;
+            break;
+          } catch (cpErr) {
+            copyErr = cpErr;
+            var code = cpErr && cpErr.code;
+            if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') break;
+            // Brief busy-wait — execFileSync has already blocked the event loop,
+            // so a synchronous spin is acceptable here.
+            var until = Date.now() + 200;
+            while (Date.now() < until) { /* spin */ }
+          }
+        }
+        if (copyErr) {
+          console.warn('[ForceUpdate] cpSync failed for ' + newEntries[ni].name + ': ' + (copyErr.message || copyErr));
+          throw copyErr;
+        }
       }
       try { fs.rmSync(TMP_TARGET, { recursive: true, force: true }); } catch (_) {}
       console.log('[ForceUpdate] GitHub Release update successful: ' + tmpPkg.version);
@@ -101,6 +119,9 @@ function executeForceUpdate(forceUpdate) {
   } catch (e) {
     console.warn('[ForceUpdate] GitHub Release failed:', e && e.message || e);
     try { fs.rmSync(TMP_TARGET, { recursive: true, force: true }); } catch (_) {}
+    // Fall through to Channel 2 (manual download URL hint) instead of
+    // returning. A Channel 1 error (degit missing, network down, tag not
+    // found) still leaves the user a path forward via the release_url.
   }
 
   // Channel 2: GitHub release (manual download URL only)

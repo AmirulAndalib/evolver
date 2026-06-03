@@ -213,11 +213,16 @@ function rollbackNewUntrackedFiles({ repoRoot, baselineUntracked, cycleStartedAt
   const dirsToCheck = new Set();
   for (let di = 0; di < deleted.length; di++) {
     let dir = path.dirname(deleted[di]);
-    while (dir && dir !== '.' && dir !== '/') {
+    // path.dirname eventually returns '.' (relative) or a filesystem root.
+    // On Windows the root is a drive letter like 'C:\', not '/'.
+    // Detect stagnation: if dirname(x) === x we have hit the root on any platform.
+    while (dir && dir !== '.') {
+      const parent = path.dirname(dir);
+      if (parent === dir) break; // filesystem root reached (e.g. 'C:\' on Windows, '/' on Unix)
       const normalized = dir.replace(/\\/g, '/');
       if (!normalized.includes('/')) break;
       dirsToCheck.add(dir);
-      dir = path.dirname(dir);
+      dir = parent;
     }
   }
   const sortedDirs = Array.from(dirsToCheck).sort(function (a, b) { return b.length - a.length; });

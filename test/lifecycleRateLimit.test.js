@@ -117,10 +117,9 @@ test('lifecycle reAuthenticate: suppresses re-entry while backoff window is acti
 });
 
 test('lifecycle reAuthenticate: backoff escalates exponentially on consecutive failures', async () => {
-  // Without escalation a daemon stuck on a bad secret gets re-poked every
-  // 30 minutes by inbound auth errors and never gives the operator a clear
-  // signal that manual recovery is needed. Each consecutive failed re-auth
-  // doubles the backoff, capped near 4 hours.
+  // Each consecutive failed re-auth doubles the backoff. Base was reduced
+  // from 30min to 2min (proxy parity with the non-proxy path), capped near
+  // 4 hours. Curve: 2, 4, 8, 16, 32, 64, 128, 240(cap)... minutes.
   const originalFetch = global.fetch;
   try {
     const mf = mockFetch(() => responseFromJson({
@@ -132,19 +131,20 @@ test('lifecycle reAuthenticate: backoff escalates exponentially on consecutive f
     store.setState('node_id', 'node_test');
     const mgr = new LifecycleManager({ hubUrl: 'https://example.test', store, logger: silentLogger() });
 
-    // Failure #1 -> ~30 min
+    // Failure #1 -> ~2 min (base)
     await mgr.reAuthenticate();
     const firstBackoff = mgr._reauthBackoffUntil - Date.now();
-    assert.ok(firstBackoff > 25 * 60_000 && firstBackoff <= 30 * 60_000, `first failure ~30min, got ${firstBackoff}ms`);
+    assert.ok(firstBackoff > 60_000 && firstBackoff <= 2 * 60_000 + 1000, `first failure ~2min, got ${firstBackoff}ms`);
 
     // Pretend the window expired so we can drive a second failure.
     mgr._reauthBackoffUntil = 0;
     await mgr.reAuthenticate();
     const secondBackoff = mgr._reauthBackoffUntil - Date.now();
-    assert.ok(secondBackoff > 50 * 60_000, `second failure must be > 50min, got ${secondBackoff}ms`);
+    assert.ok(secondBackoff > 3 * 60_000 && secondBackoff <= 4 * 60_000 + 1000, `second failure ~4min, got ${secondBackoff}ms`);
 
-    // Drive a few more and verify the cap kicks in.
-    for (let i = 0; i < 6; i++) {
+    // Drive enough more to saturate the 4h cap. Base 2min * 2^(n-1):
+    // n=8 -> 256min -> capped at 240min. Run until we're well past the cap.
+    for (let i = 0; i < 8; i++) {
       mgr._reauthBackoffUntil = 0;
       await mgr.reAuthenticate();
     }

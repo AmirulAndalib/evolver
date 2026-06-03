@@ -8,6 +8,8 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const https = require('https');
+const http = require('http');
 const { spawnSync } = require('child_process');
 // 10 MB — prevents RangeError on large child process output (e.g. git log/diff
 // on large repos). See GHSA reports / issue #451.
@@ -116,6 +118,9 @@ function recordToHub(outcome) {
   const nodeId = process.env.EVOMAP_NODE_ID || process.env.A2A_NODE_ID;
   if (!hubUrl || !apiKey) return false;
 
+  // Use Node.js built-in http/https instead of curl so this works on all
+  // platforms, including Windows where curl may not be available or may be
+  // an older, incompatible version bundled with some environments.
   try {
     const payload = JSON.stringify({
       gene_id: outcome.geneId || 'ad_hoc',
@@ -125,22 +130,39 @@ function recordToHub(outcome) {
       summary: outcome.summary,
       sender_id: nodeId || undefined,
     });
-    // Argv-array form avoids shell interpretation of apiKey, payload, or the
-    // hub URL. Values cannot break out through shell metacharacters.
-    const res = spawnSync('curl', [
-      '-s', '-m', '8', '-X', 'POST',
-      '-H', 'Content-Type: application/json',
-      '-H', `Authorization: Bearer ${apiKey}`,
-      '-d', payload,
-      `${hubUrl.replace(/\/+$/, '')}/a2a/evolution/record`,
-    ], {
-      timeout: 10000,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      maxBuffer: MAX_EXEC_BUFFER,
-      shell: false,
+
+    const endpoint = hubUrl.replace(/\/+$/, '') + '/a2a/evolution/record';
+    let parsedUrl;
+    try { parsedUrl = new URL(endpoint); } catch { return false; }
+
+    const isHttps = parsedUrl.protocol === 'https:';
+    const transport = isHttps ? https : http;
+
+    return new Promise((resolve) => {
+      const req = transport.request(
+        {
+          hostname: parsedUrl.hostname,
+          port: parsedUrl.port || (isHttps ? 443 : 80),
+          path: parsedUrl.pathname + (parsedUrl.search || ''),
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Length': Buffer.byteLength(payload),
+          },
+          timeout: 8000,
+        },
+        (res) => {
+          // Drain the response to free the socket; we only care about status.
+          res.resume();
+          resolve(res.statusCode >= 200 && res.statusCode < 300);
+        }
+      );
+      req.on('error', () => resolve(false));
+      req.on('timeout', () => { req.destroy(); resolve(false); });
+      req.write(payload);
+      req.end();
     });
-    if (res.status !== 0 || res.error) return false;
-    return true;
   } catch {
     return false;
   }
@@ -227,78 +249,88 @@ function main() {
   process.stdin.on('data', chunk => { inputData += chunk; });
   process.stdin.on('end', () => {
     if (handled) return;
-    try {
-      const diffInfo = getGitDiffStats();
+    // recordToHub is async (uses Node.js http/https); wrap the rest of the
+    // handler in an immediately-invoked async function so we can await it
+    // while still honouring the watchdog timeout and the `handled` guard.
+    (async () => {
+      try {
+        const diffInfo = getGitDiffStats();
 
-      if (!diffInfo.hasChanges) {
-        // No git diff means no signal source — session-end derives the
-        // outcome (status/score/signals/summary) entirely from the diff, so
-        // there is nothing meaningful to record. This is expected in a
-        // non-git workspace or a repo with no changes this session. Rather
-        // than fabricate an empty outcome (which would pollute the memory
-        // graph), record nothing — but leave a log breadcrumb so the user
-        // can tell "evolver ran but had nothing to record" apart from
-        // "evolver never fired". (Previously this branch was fully silent.)
-        const reason = diffInfo.isRepo
-          ? 'no changes detected this session'
-          : 'not a git workspace';
-        appendEvolutionLog(`[Evolution] Session end: nothing recorded (${reason}).`);
+        if (!diffInfo.hasChanges) {
+          // No git diff means no signal source — session-end derives the
+          // outcome (status/score/signals/summary) entirely from the diff, so
+          // there is nothing meaningful to record. This is expected in a
+          // non-git workspace or a repo with no changes this session. Rather
+          // than fabricate an empty outcome (which would pollute the memory
+          // graph), record nothing — but leave a log breadcrumb so the user
+          // can tell "evolver ran but had nothing to record" apart from
+          // "evolver never fired".
+          const reason = diffInfo.isRepo
+            ? 'no changes detected this session'
+            : 'not a git workspace';
+          appendEvolutionLog(`[Evolution] Session end: nothing recorded (${reason}).`);
+          finish({});
+          return;
+        }
+
+        const signals = detectSignals(diffInfo.diffSnippet);
+        if (signals.length === 0) signals.push('stable_success_plateau');
+
+        const hasErrors = signals.includes('log_error') || signals.includes('test_failure');
+        const status = hasErrors ? 'failed' : 'success';
+        const score = hasErrors ? 0.3 : 0.8;
+
+        const outcome = {
+          geneId: 'ad_hoc',
+          signals,
+          status,
+          score,
+          summary: `Session end: ${diffInfo.summary}. Signals: [${signals.join(', ')}]`,
+        };
+
+        const evolverRoot = findEvolverRoot();
+        const graphPath = findMemoryGraph(evolverRoot);
+
+        // Local first: recordToHub is async with an 8s socket timeout, but
+        // the 7s watchdog (setTimeout below) will process.exit(0) before a
+        // slow hub returns — so anything sequenced after `await recordToHub`
+        // can be silently skipped. recordToLocal is the reliable offline
+        // fallback and must run regardless of hub latency.
+        const localOk = graphPath ? recordToLocal(graphPath, outcome) : false;
+        const hubOk = await recordToHub(outcome);
+
+        const target = hubOk ? 'Hub' : localOk ? 'local memory' : 'nowhere (no Hub or local path)';
+        const msg = `[Evolution] Session outcome recorded to ${target}: ${outcome.summary}`;
+
+        // Stop hook output schema (per Claude Code docs):
+        //   - decision: "approve" | "block"
+        //   - reason: string (shown when decision is set)
+        //   - systemMessage: string (notification displayed to user)
+        //   - continue: boolean
+        //   - stopReason: string
+        //
+        // Earlier versions emitted `followup_message`, `stopMessage`, and
+        // `additionalContext` together. `followup_message` is the field that
+        // re-injects the receipt into Claude's next inference round, which
+        // caused the agent to "respond" to its own evolution log line —
+        // visible to users as an unexplained extra reasoning turn after
+        // every task. The evolver is supposed to be observational, so we
+        // now use `systemMessage` only — that surfaces the receipt to the
+        // user without forcing another inference round.
+        //
+        // Cursor compatibility: Cursor's Claude Code-compatible runtime
+        // currently treats `systemMessage` as a user prompt for the next
+        // inference round. When we detect Cursor, omit systemMessage too.
+        // The receipt is always appended to ~/.evolver/logs/evolution.log
+        // so it is never silently lost; users can opt back in to the inline
+        // notification with EVOLVER_HOOK_VERBOSE=1.
+        appendEvolutionLog(msg);
+
+        finish(isCursorHost() ? {} : { systemMessage: msg });
+      } catch (e) {
         finish({});
-        return;
       }
-
-      const signals = detectSignals(diffInfo.diffSnippet);
-      if (signals.length === 0) signals.push('stable_success_plateau');
-
-      const hasErrors = signals.includes('log_error') || signals.includes('test_failure');
-      const status = hasErrors ? 'failed' : 'success';
-      const score = hasErrors ? 0.3 : 0.8;
-
-      const outcome = {
-        geneId: 'ad_hoc',
-        signals,
-        status,
-        score,
-        summary: `Session end: ${diffInfo.summary}. Signals: [${signals.join(', ')}]`,
-      };
-
-      const evolverRoot = findEvolverRoot();
-      const graphPath = findMemoryGraph(evolverRoot);
-
-      const hubOk = recordToHub(outcome);
-      const localOk = graphPath ? recordToLocal(graphPath, outcome) : false;
-
-      const target = hubOk ? 'Hub' : localOk ? 'local memory' : 'nowhere (no Hub or local path)';
-      const msg = `[Evolution] Session outcome recorded to ${target}: ${outcome.summary}`;
-
-      // Stop hook output schema (per Claude Code docs):
-      //   - decision: "approve" | "block"
-      //   - reason: string (shown when decision is set)
-      //   - systemMessage: string (notification displayed to user)
-      //   - continue: boolean
-      //   - stopReason: string
-      //
-      // Earlier versions emitted `followup_message`, `stopMessage`, and
-      // `additionalContext` together. `followup_message` is the field that
-      // re-injects the receipt into Claude's next inference round, which
-      // caused the agent to "respond" to its own evolution log line —
-      // visible to users as an unexplained extra reasoning turn after
-      // every task. The evolver is supposed to be observational, so we
-      // now use `systemMessage` only — that surfaces the receipt to the
-      // user without forcing another inference round.
-      //
-      // Cursor compatibility: Cursor's Claude Code-compatible runtime
-      // currently treats `systemMessage` as a user prompt for the next
-      // inference round. When we detect Cursor, omit systemMessage too.
-      // The receipt is always appended to ~/.evolver/logs/evolution.log
-      // so it is never silently lost; users can opt back in to the inline
-      // notification with EVOLVER_HOOK_VERBOSE=1.
-      appendEvolutionLog(msg);
-
-      finish(isCursorHost() ? {} : { systemMessage: msg });
-    } catch (e) {
-      finish({});
-    }
+    })();
   });
 
   watchdog = setTimeout(() => finish({}), 7000);

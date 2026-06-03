@@ -4,6 +4,30 @@
 // evolution intensity levels. Monitors system idle time on supported platforms.
 // When idle, the evolver can run more aggressive operations (distillation,
 // reflection); when busy, it only collects signals.
+//
+// Headless / no-X11 Linux notes
+// --------------------------------
+// On headless Linux servers (no X11 display), `xprintidle` is unavailable and
+// will always fail, causing getSystemIdleSeconds() to return -1. This is also
+// true inside Docker containers, SSH-only servers, and most CI runners.
+//
+// When idleSeconds === -1, determineIntensity() falls back to 'normal' by
+// default. On a truly headless server there is no interactive user, so the
+// machine is effectively always idle — 'normal' may be too conservative for a
+// dedicated evolver host yet too aggressive for a shared CI runner.
+//
+// Override options (in order of precedence):
+//   EVOLVER_INTENSITY=aggressive   force a fixed intensity level regardless of
+//   EVOLVER_INTENSITY=deep         idle detection. Valid values: signal_only,
+//   EVOLVER_INTENSITY=normal       normal, aggressive, deep.
+//   EVOLVER_INTENSITY=signal_only
+//
+// Alternatives to xprintidle on headless systems:
+//   - Set EVOLVER_INTENSITY to the desired level in the service unit / crontab.
+//   - Use `loginctl show-session` to detect attached TTY sessions and set the
+//     env var conditionally in a wrapper script.
+//   - Install `xprintidle` and export DISPLAY=:0 only if a virtual framebuffer
+//     (Xvfb) is running — not recommended for pure server deployments.
 
 const { execSync, execFileSync } = require('child_process');
 // 10 MB — prevents RangeError on large child process output (e.g. git log/diff
@@ -16,6 +40,44 @@ const { getEvolutionDir } = require('./paths');
 
 const IDLE_THRESHOLD_SECONDS = parseInt(process.env.OMLS_IDLE_THRESHOLD || '300', 10) || 300;
 const DEEP_IDLE_THRESHOLD_SECONDS = parseInt(process.env.OMLS_DEEP_IDLE_THRESHOLD || '1800', 10) || 1800;
+
+// EVOLVER_INTENSITY: when set, bypasses idle detection entirely and pins the
+// scheduler to this intensity level. Useful on headless servers where
+// xprintidle is unavailable and the machine is always effectively idle.
+// Accepted values (case-insensitive): signal_only | normal | aggressive | deep.
+const VALID_INTENSITIES = new Set(['signal_only', 'normal', 'aggressive', 'deep']);
+const _forcedIntensity = (function () {
+  const raw = (process.env.EVOLVER_INTENSITY || '').trim().toLowerCase();
+  if (raw && VALID_INTENSITIES.has(raw)) return raw;
+  if (raw) {
+    // Warn once at startup rather than silently ignoring a typo.
+    console.warn(
+      '[idleScheduler] EVOLVER_INTENSITY="' + raw + '" is not a recognised value. ' +
+      'Valid values: signal_only, normal, aggressive, deep. Falling back to idle detection.'
+    );
+  }
+  return null;
+}());
+
+// In-process cache to avoid spawning `ioreg` (darwin) / `xprintidle` (linux)
+// / a powershell child (win32) on EVERY evolve cycle. Each call has a
+// hard timeout (5-10s) but in practice ioreg takes ~50-200ms and
+// powershell startup ~500-800ms; doing that synchronously on the main
+// thread once per cycle stacks 1-2s of blocking time per loop iteration
+// onto whatever other sync IO the cycle did (git, gh, npm view). The 2s
+// TTL means we still re-sample frequently enough to detect a user
+// becoming active mid-cycle, but we are not paying the spawn cost in a
+// tight loop. The cache is intentionally per-process (no fs writes): a
+// daemon and an ad-hoc CLI invocation pay independent costs.
+let _idleCache = { at: 0, value: -1 };
+const _IDLE_CACHE_TTL_MS = 2000;
+function _getCachedIdleSeconds(compute) {
+  const now = Date.now();
+  if (now - _idleCache.at < _IDLE_CACHE_TTL_MS) return _idleCache.value;
+  const v = compute();
+  _idleCache = { at: now, value: v };
+  return v;
+}
 
 // Linux idle detection — overridable for tests via __test.setExec() /
 // __test.setExecFile(). Two helpers because of a security distinction:
@@ -151,6 +213,10 @@ function _getLinuxIdleSeconds() {
 }
 
 function getSystemIdleSeconds() {
+  return _getCachedIdleSeconds(_getSystemIdleSecondsUncached);
+}
+
+function _getSystemIdleSecondsUncached() {
   const platform = process.platform;
   try {
     if (platform === 'win32') {
@@ -201,7 +267,17 @@ function getSystemIdleSeconds() {
 //   'normal'       - standard evolution cycle
 //   'aggressive'   - run distillation, reflection, deeper analysis
 //   'deep'         - extended operations (future: RL, fine-tuning triggers)
+//
+// idleSeconds === -1 means idle detection is unavailable (e.g. headless Linux
+// with no X11/xprintidle). The default fallback is 'normal'. To override this
+// on a server set EVOLVER_INTENSITY in the environment (see top-of-file docs).
 function determineIntensity(idleSeconds) {
+  // Environment override takes precedence over any measured or inferred value.
+  if (_forcedIntensity) return _forcedIntensity;
+
+  // idleSeconds < 0: idle detection unavailable (headless / unsupported env).
+  // Default to 'normal' so a shared CI runner is not inadvertently hammered.
+  // On a dedicated evolver server, set EVOLVER_INTENSITY=aggressive instead.
   if (idleSeconds < 0) return 'normal';
   if (idleSeconds >= DEEP_IDLE_THRESHOLD_SECONDS) return 'deep';
   if (idleSeconds >= IDLE_THRESHOLD_SECONDS) return 'aggressive';
@@ -300,6 +376,8 @@ module.exports = {
   writeScheduleState: writeScheduleState,
   IDLE_THRESHOLD_SECONDS: IDLE_THRESHOLD_SECONDS,
   DEEP_IDLE_THRESHOLD_SECONDS: DEEP_IDLE_THRESHOLD_SECONDS,
+  // Exposed for inspection / testing; null means no override is active.
+  _forcedIntensity: _forcedIntensity,
   // Test-only surface for the Linux multi-tier idle detection. Lets tests
   // inject a fake exec implementation so we can verify the fallback chain
   // (xprintidle -> gnome-mutter -> loginctl) and the cached-method fast path

@@ -96,7 +96,8 @@ function autoHeal(skillName, issues) {
                 // Remove package-lock.json if it exists to prevent conflict errors
                 try { fs.unlinkSync(path.join(skillPath, 'package-lock.json')); } catch (e) {}
                 
-                execSync('npm install --production --no-audit --no-fund --ignore-scripts', {
+                const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+                execSync(npmBin + ' install --production --no-audit --no-fund --ignore-scripts', {
                     cwd: skillPath, stdio: 'ignore', timeout: 60000 // Increased timeout, maxBuffer: MAX_EXEC_BUFFER
                 });
                 healed.push(issues[i]);

@@ -133,6 +133,9 @@ function _loadStateFromDisk() {
 }
 
 function _persistState() {
+  // NOTE(windows): mode 0o700 / 0o600 are silently ignored on Windows.
+  // The stake-state file will NOT be access-restricted to the current user.
+  // Only user-profile directory ACLs provide isolation on Windows.
   try {
     const file = _stateFile();
     const dir = path.dirname(file);

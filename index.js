@@ -42,14 +42,94 @@ try {
 const evolve = require('./src/evolve');
 const { solidify } = require('./src/gep/solidify');
 const path = require('path');
+const os = require('os');
 const { getRepoRoot } = require('./src/gep/paths');
 const fs = require('fs');
 const { spawn } = require('child_process');
 
+// Interruptible sleep: SIGCONT (and any future wake hook) can short-circuit
+// pending sleeps so a daemon that just woke from macOS sleep doesn't sit
+// out the rest of its pre-sleep adaptive-sleep window on the resumed
+// monotonic clock. Without this, the heartbeat side recovers via the
+// drift detector but the outer evolve cycle stays paused up to maxSleepMs
+// (default 5 min) after wake. Each call tracks its own resolver in
+// _activeSleeps so the wake hook can resolve all of them.
+const _activeSleeps = new Set();
 function sleepMs(ms) {
   const n = parseInt(String(ms), 10);
   const t = Number.isFinite(n) ? Math.max(0, n) : 0;
-  return new Promise(resolve => setTimeout(resolve, t));
+  return new Promise(resolve => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      _activeSleeps.delete(finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, t);
+    // NOTE: intentionally NOT calling timer.unref() here. When the daemon is in
+    // a long adaptive sleep (up to maxSleepMs = 5 min by default), this timer is
+    // often the ONLY ref'd handle keeping the event loop alive. All other timers
+    // (_heartbeatTimer, _heartbeatDriftInterval, _selfDrivingPollTimer, etc.) are
+    // unref'd, so once the evolve loop's sleepMs timer was also unref'd, Node.js
+    // could see zero ref'd handles and silently exit the process mid-sleep. That
+    // was the root cause of "first launch ok, idle for a while, then evolver dead
+    // with no log trace" on macOS. A ref'd sleep timer is the load-bearing event-
+    // loop anchor during idle periods; it fires within maxSleepMs and the daemon
+    // then reschedules itself normally. Leaving it ref'd has no observable cost.
+    _activeSleeps.add(finish);
+  });
+}
+function _interruptAllSleeps() {
+  if (_activeSleeps.size === 0) return;
+  // Snapshot first because resolvers mutate the set as they run.
+  const finishers = Array.from(_activeSleeps);
+  for (const fn of finishers) {
+    try { fn(); } catch (_) {}
+  }
+}
+
+// Round-6 (§19.5): heartbeat-internal wake recovery (drainPool +
+// pokeHeartbeat + SSE restart + self-driving-poll re-arm) lives in
+// a2aProtocol so the drift detector can drive it directly. Process-
+// level wake hooks (sleepMs interrupter, validator daemon poke) are
+// registered with a2aProtocol so both the SIGCONT handler and the
+// drift detector long-sleep branch run them. Lazy-register so requires
+// resolve cleanly under test (single Set of registered hooks; cheap to
+// re-register idempotently).
+let _wakeHooksRegistered = false;
+function _registerProcessWakeHooks() {
+  if (_wakeHooksRegistered) return;
+  try {
+    const a2a = require('./src/gep/a2aProtocol.js');
+    if (typeof a2a.registerWakeHook !== 'function') return;
+    a2a.registerWakeHook(function () {
+      try { _interruptAllSleeps(); } catch (_) {}
+    });
+    // R13: guards.sleepMs is a separate private helper used for 60-120s
+    // backoffs inside evolve.run() arms (active-sessions, system-load,
+    // pending-solidify). Without this hook, a guard sleep that spans
+    // macOS suspend would block the cycle for the full window on the
+    // resumed monotonic clock even though the outer sleep was interrupted.
+    a2a.registerWakeHook(function () {
+      try {
+        const guards = require('./src/evolve/guards');
+        if (guards && typeof guards._interruptGuardSleeps === 'function') {
+          guards._interruptGuardSleeps();
+        }
+      } catch (_) {}
+    });
+    a2a.registerWakeHook(function () {
+      try {
+        const v = require('./src/gep/validator');
+        if (v && typeof v.pokeValidatorDaemon === 'function') {
+          v.pokeValidatorDaemon();
+        }
+      } catch (_) {}
+    });
+    _wakeHooksRegistered = true;
+  } catch (_) {}
 }
 
 function readJsonSafe(p) {
@@ -186,35 +266,256 @@ function getLastSignals(statePath) {
   }
 }
 
-// Singleton Guard - prevent multiple evolver daemon instances
+// Singleton Guard - prevent multiple evolver daemon instances.
+//
+// Round-4: pidfile location previously defaulted to __dirname, which is a
+// DIFFERENT path per install mode -- /usr/local/lib/node_modules/... for a
+// global install, the dev-clone path for `node index.js`, a transient
+// $NPM_CACHE/_npx/<hash> for `npx evolver`. Two daemons launched under
+// different install modes never saw each other's lock and could run
+// concurrently against the same ~/.evomap/node_secret, ping-ponging on
+// secret rotation and silently entering reauth backoff -- the user-
+// reported "first launch ok, idle, then dead forever" pattern. Default
+// now lives under the per-user state dir so all install modes converge.
+// EVOLVER_LOCK_DIR still overrides for tests / sandboxed runs.
 function getLockFilePath() {
-  // Allow tests / sandboxed runs to override the pid-file location so they
-  // do not collide with a real daemon's lock at the source-dir default.
-  const dir = process.env.EVOLVER_LOCK_DIR || __dirname;
-  return path.join(dir, 'evolver.pid');
+  if (process.env.EVOLVER_LOCK_DIR) {
+    return path.join(process.env.EVOLVER_LOCK_DIR, 'evolver.pid');
+  }
+  // os.homedir() is cross-platform; process.env.HOME is unset on Windows.
+  return path.join(os.homedir(), '.evomap', 'instance.lock');
 }
+
+function _writeLockAtomic(lockFile, payload) {
+  // Round-6 (§19.8): the previous implementation used tmp + rename, which
+  // makes the WRITE atomic but not the OWNERSHIP claim. Two processes
+  // could both rename their own tmp file over the same lockFile (rename
+  // is atomic per call but successive renames overwrite each other), then
+  // each read it back and -- if the second rename happened between the
+  // first process's rename and its read-back -- see the OTHER process's
+  // PID. Each then concludes "I lost the race" and exits, leaving the
+  // lockFile owned by no live process. Symmetrically, two processes can
+  // each see their own PID if the reads happen between their respective
+  // renames, and both conclude they won.
+  //
+  // The proper primitive is link(2): given a unique tmp file, link to the
+  // target path fails atomically with EEXIST if the target already
+  // exists. Only one of N concurrent linkers succeeds.
+  // NOTE(windows): mode 0o700 / 0o600 are silently ignored on Windows.
+  // The lock directory and tmp file will NOT be owner-only on Windows.
+  // Isolation relies solely on the user-profile directory ACLs.
+  const dir = path.dirname(lockFile);
+  try { fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch (_) {}
+  const tmp = lockFile + '.' + process.pid + '.tmp';
+  fs.writeFileSync(tmp, payload, { encoding: 'utf8', mode: 0o600 });
+  // link() requires the target NOT to exist. The caller in the takeover
+  // path has already unlinked the stale lockFile via fs.unlinkSync
+  // (ignoring ENOENT). If a concurrent process beat us to the link, our
+  // linkSync below throws EEXIST -- we surface that to the caller and
+  // clean up our tmp.
+  //
+  // EXDEV: fs.link() fails with EXDEV when tmp and lockFile are on different
+  // volumes (can happen on Windows when EVOLVER_LOCK_DIR points to a drive
+  // other than the tmp dir). Fall back to renameSync, which Node.js handles
+  // cross-device by copying + deleting. rename is not atomic in this path,
+  // so the EEXIST guard is lost, but this is an unusual configuration and
+  // the result is still safe (worst case: two daemons both think they won,
+  // the second write wins, the first will exit on its next tick when it
+  // reads back a foreign PID via the heartbeat).
+  try {
+    fs.linkSync(tmp, lockFile);
+  } catch (err) {
+    if (err && err.code === 'EXDEV') {
+      // Cross-device: rename falls back to copy+delete inside Node.js; this
+      // loses the atomic-EEXIST guarantee but is better than hard-failing.
+      try {
+        fs.renameSync(tmp, lockFile);
+      } catch (renameErr) {
+        try { fs.unlinkSync(tmp); } catch (_) {}
+        throw renameErr;
+      }
+      return; // tmp has been consumed by renameSync, skip unlinkSync below
+    }
+    try { fs.unlinkSync(tmp); } catch (_) {}
+    throw err;
+  }
+  try { fs.unlinkSync(tmp); } catch (_) {}
+}
+
+function _readLockPayload(lockFile) {
+  try {
+    const raw = fs.readFileSync(lockFile, 'utf8').trim();
+    if (!raw) return null;
+    // Backward-compat: older lock files contained only the pid as text.
+    // Newer payloads are JSON {pid, uid, startedAt}.
+    if (raw[0] === '{') {
+      try { return JSON.parse(raw); } catch (_) { return null; }
+    }
+    const pid = parseInt(raw, 10);
+    return Number.isFinite(pid) && pid > 0 ? { pid: pid } : null;
+  } catch (_) { return null; }
+}
+
+function _lockPayload() {
+  return JSON.stringify({
+    pid: process.pid,
+    uid: typeof process.getuid === 'function' ? process.getuid() : null,
+    startedAt: new Date().toISOString(),
+    // Round-9: marks a daemon that refreshes this lock file's mtime on a
+    // lease (see startLockRefresh). Only when this flag is present do
+    // acquireLock / refuseHelloIfDaemonRunning trust mtime-staleness to
+    // reclaim a lock whose PID is alive -- the PID-reuse / SIGKILL-stale
+    // guard. A lock written by an OLDER daemon (no flag) keeps the legacy
+    // kill(0)-only behavior so a new binary can never falsely steal a
+    // still-running old daemon's lock (which would run two daemons).
+    lease: true,
+  });
+}
+
+// Round-9: lease tunables for the daemon lock. A live daemon refreshes the
+// lock mtime every LOCK_REFRESH_MS; a lock whose mtime is older than
+// STALE_LOCK_TTL_MS (and that was written by a lease-aware daemon) is
+// treated as stale even if its PID happens to be alive -- closing the
+// "crash + PID reuse -> new daemon silently refuses to start" hole and the
+// "SIGKILL leaves a stale lock nobody reclaims" hole. The TTL is well above
+// the heartbeat interval (default 6min) so a healthy daemon never trips it.
+// On Windows, SIGTERM is implemented as TerminateProcess() (not a catchable
+// signal), so the shutdown() handler that calls releaseLock() never runs.
+// The lock file stays on disk with the dead PID. Reduce the TTL on Windows
+// so a subsequent start doesn't wait 15 minutes to reclaim the stale lock.
+// Unix dropped from 15 min -> 5 min so a wedged daemon does not block takeover
+// for a quarter hour. 5 min is still 2.5x the 2-min Unix refresh cadence.
+// Windows 3 min TTL gets a 1-min refresh (3x margin) since 2-min refresh left
+// only 1.5x margin against transient FS hiccups.
+const STALE_LOCK_TTL_MS = process.platform === 'win32' ? 3 * 60_000 : 5 * 60_000;
+const LOCK_REFRESH_MS = process.platform === 'win32' ? 1 * 60_000 : 2 * 60_000;
+let _lockRefreshTimer = null;
+
+// Returns true if the lock was written by a lease-aware daemon AND its
+// mtime is older than the stale TTL -- i.e. no live owner is refreshing it,
+// so it is safe to reclaim regardless of whether the recorded PID resolves.
+function _lockIsStaleByLease(lockFile, payload) {
+  if (!payload || payload.lease !== true) return false;
+  try {
+    const ageMs = Date.now() - fs.statSync(lockFile).mtimeMs;
+    return ageMs > STALE_LOCK_TTL_MS;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Start refreshing the lock file's mtime so other processes can tell this
+// daemon is alive without trusting a (recyclable) PID. unref'd: it never
+// keeps the event loop open on its own, but fires for as long as the daemon
+// is otherwise alive.
+function startLockRefresh() {
+  if (_lockRefreshTimer) return;
+  const lockFile = getLockFilePath();
+  _lockRefreshTimer = setInterval(function () {
+    try {
+      const now = new Date();
+      fs.utimesSync(lockFile, now, now);
+    } catch (_) { /* lock gone / FS error: nothing we can do here */ }
+  }, LOCK_REFRESH_MS);
+  if (_lockRefreshTimer && typeof _lockRefreshTimer.unref === 'function') {
+    _lockRefreshTimer.unref();
+  }
+}
+
+function stopLockRefresh() {
+  if (_lockRefreshTimer) {
+    clearInterval(_lockRefreshTimer);
+    _lockRefreshTimer = null;
+  }
+}
+
 function acquireLock() {
   const lockFile = getLockFilePath();
+  // NOTE(windows): mode 0o700 / 0o600 are silently ignored on Windows.
+  // Lock directory and file permissions provide no OS-level isolation on
+  // Windows; rely on user-profile directory ACLs (%USERPROFILE%\.evomap).
   try {
+    try { fs.mkdirSync(path.dirname(lockFile), { recursive: true, mode: 0o700 }); } catch (_) {}
     try {
-      fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
+      fs.writeFileSync(lockFile, _lockPayload(), { flag: 'wx', mode: 0o600 });
       return true;
     } catch (exclErr) {
       if (exclErr.code !== 'EEXIST') throw exclErr;
     }
-    const pid = parseInt(fs.readFileSync(lockFile, 'utf8').trim(), 10);
-    if (!Number.isFinite(pid) || pid <= 0) {
-      console.log('[Singleton] Corrupt lock file (invalid PID). Taking over.');
+    const payload = _readLockPayload(lockFile);
+    if (!payload || !Number.isFinite(payload.pid) || payload.pid <= 0) {
+      console.log('[Singleton] Corrupt lock file. Taking over.');
+    } else if (_lockIsStaleByLease(lockFile, payload)) {
+      // Round-9: a lease-aware daemon has not refreshed this lock's mtime
+      // within the stale TTL. Either it was SIGKILLed/crashed, or its PID
+      // has since been reused by an unrelated process (kill(0) below would
+      // then falsely report it alive and we would refuse to start forever).
+      // The expired lease is authoritative: take over.
+      console.log('[Singleton] Lock lease expired (PID ' + payload.pid + ', no mtime refresh for > ' +
+        Math.round(STALE_LOCK_TTL_MS / 60_000) + 'min). Taking over.');
     } else {
       try {
-        process.kill(pid, 0);
-        console.log(`[Singleton] Evolver loop already running (PID ${pid}). Exiting.`);
+        process.kill(payload.pid, 0);
+        // Process exists. Distinguish "alive, our user" (refuse) from
+        // "alive, different uid" (also refuse -- never barge into a root
+        // daemon under a user-launched evolver, etc.).
+        console.log(`[Singleton] Evolver loop already running (PID ${payload.pid}). Exiting.`);
         return false;
       } catch (e) {
-        console.log(`[Singleton] Stale lock found (PID ${pid}). Taking over.`);
+        if (e && e.code === 'EPERM') {
+          // PID exists but belongs to another user. Conservatively
+          // refuse: barging in would race the existing daemon for
+          // secret/heartbeat ownership.
+          console.warn(`[Singleton] Lock owned by PID ${payload.pid} (different user). Refusing to take over. ` +
+            `Remove ${lockFile} manually if the PID is actually dead.`);
+          return false;
+        }
+        console.log(`[Singleton] Stale lock found (PID ${payload.pid}). Taking over.`);
       }
     }
-    fs.writeFileSync(lockFile, String(process.pid));
+    // Atomic takeover so two daemons that both observe the same stale PID
+    // and pass the kill(0) check cannot both end up "owning" the lock.
+    //
+    // Bug it fixes: the previous "unconditional unlinkSync then linkSync"
+    // pattern was NOT atomic across acquirers. Interleaving where P1 wins
+    // the linkSync but P2's unlinkSync then deletes P1's freshly-linked
+    // file (P2 never re-verifies it's deleting the same stale lock it
+    // observed) lets P2's subsequent linkSync also succeed. Both processes
+    // then return true and start a daemon, racing each other on the
+    // shared singleton secret store.
+    //
+    // renameSync is atomic at the filesystem level: only one of N racing
+    // acquirers can move the stale lockFile to a unique claim name, the
+    // rest see ENOENT and abort. After the claim succeeds, _writeLockAtomic
+    // installs the fresh lock; the claim file is unlinked in every exit
+    // path so it doesn't accumulate.
+    const claimFile = lockFile + '.' + process.pid + '.' + Date.now() + '.takeover';
+    try {
+      fs.renameSync(lockFile, claimFile);
+    } catch (e) {
+      if (e && e.code === 'ENOENT') {
+        // Another concurrent acquirer already claimed the stale lock.
+        // They'll race us on _writeLockAtomic below; the EEXIST branch
+        // handles the loser case correctly.
+      } else {
+        console.warn('[Singleton] Cannot claim stale lock at ' + lockFile + ': ' + e.message);
+        return false;
+      }
+    }
+    try {
+      _writeLockAtomic(lockFile, _lockPayload());
+    } catch (linkErr) {
+      try { fs.unlinkSync(claimFile); } catch (_) {}
+      if (linkErr && linkErr.code === 'EEXIST') {
+        // Lost the link race to another concurrent acquirer. Read who
+        // won (best-effort) for the log line.
+        const winner = _readLockPayload(lockFile);
+        console.log('[Singleton] Lost takeover race to PID ' + (winner && winner.pid) + '. Exiting.');
+        return false;
+      }
+      throw linkErr;
+    }
+    try { fs.unlinkSync(claimFile); } catch (_) {}
     return true;
   } catch (err) {
     console.error('[Singleton] Lock acquisition failed:', err);
@@ -226,10 +527,71 @@ function releaseLock() {
   const lockFile = getLockFilePath();
   try {
     if (fs.existsSync(lockFile)) {
-       const pid = parseInt(fs.readFileSync(lockFile, 'utf8').trim(), 10);
-       if (pid === process.pid) fs.unlinkSync(lockFile);
+      const payload = _readLockPayload(lockFile);
+      if (payload && payload.pid === process.pid) fs.unlinkSync(lockFile);
     }
   } catch (e) { /* ignore */ }
+}
+
+// Round-7 (§20.7): the daemon-lock acquireLock() only fires for `--loop`
+// mode; CLI subcommands like `evolver fetch` and `evolver sync` run
+// without acquiring the lock and freely call sendHelloToHub when
+// node_secret is missing. The hub-side hello-with-rotate rewrites the
+// node_secret on disk, so two writers (the daemon's heartbeat path
+// rotating one secret + this CLI's sendHelloToHub writing a different
+// one) race to be "last writer." Whichever wrote second silences the
+// other -- the daemon then 401-loops -> enters reauth backoff -> goes
+// silent for 30 min..4 h. The original §6 "instance lock" scenario.
+//
+// This helper does NOT take the lock (the daemon legitimately owns it);
+// it only refuses to proceed if a LIVE daemon owns the lock AND we are
+// about to send a fresh hello. If the daemon is alive it already has a
+// valid secret in ~/.evomap/node_secret, so the right thing for the CLI
+// is to wait briefly for the secret to appear (newly registered daemon)
+// or exit with an actionable error.
+//
+// Callers: every CLI subcommand whose runner could call sendHelloToHub()
+// when getHubNodeSecret() returns empty. Currently: fetch, sync
+// (round-7 §20.7), plus atp-complete, buy, orders, verify (round-8
+// §21.8 -- the ATP runners hit the same vector via consumerAgent /
+// merchantAgent / atpExecute paths).
+function refuseHelloIfDaemonRunning(toolLabel) {
+  try {
+    const lockFile = getLockFilePath();
+    if (!fs.existsSync(lockFile)) return; // no daemon
+    const payload = _readLockPayload(lockFile);
+    if (!payload || !Number.isFinite(payload.pid) || payload.pid <= 0) return;
+    if (payload.pid === process.pid) return; // shouldn't happen for CLI
+    // Round-9: a lease-aware lock whose mtime has gone stale means the
+    // daemon is dead (or its PID was reused). Do NOT refuse on it -- that
+    // was the "CLI hard-exits because it trusts a recyclable PID" hole.
+    if (_lockIsStaleByLease(lockFile, payload)) return;
+    try {
+      process.kill(payload.pid, 0);
+    } catch (e) {
+      if (e && e.code === 'ESRCH') return; // stale lock, daemon is gone
+      // EPERM = alive under a different user; still a real daemon. Fall
+      // through to refuse.
+    }
+    console.error(
+      '[' + toolLabel + '] Refusing to send hello: an evolver daemon ' +
+      '(PID ' + payload.pid + ') is running and owns ~/.evomap/instance.lock.'
+    );
+    console.error(
+      '       Two concurrent hello calls would rotate node_secret against ' +
+      'each other and silence the daemon for hours.'
+    );
+    console.error(
+      '       Either wait for the daemon to register (the secret will ' +
+      'appear at ~/.evomap/node_secret), or stop the daemon and retry.'
+    );
+    process.exit(1);
+  } catch (_) {
+    // Never let the lock-check helper itself escape; if the helper
+    // throws (FS permission, etc.) we fall through to the original code
+    // path. The race we're protecting against is rare; failing closed
+    // here would block legitimate CLI use.
+  }
 }
 
 async function main() {
@@ -242,13 +604,49 @@ async function main() {
 
   if (!command || command === 'run' || command === '/evolve' || isLoop) {
     if (isLoop) {
+        // EPIPE protection. The daemon may outlive the controlling
+        // terminal (user closes the iTerm tab, ssh session drops, parent
+        // shell exits). The SIGHUP handler below covers the signal side,
+        // but the underlying pty fd is gone and the FIRST subsequent
+        // console.log writes to a closed pipe -> stdout emits 'error'
+        // with EPIPE. Without a listener attached, Node escalates EPIPE
+        // to uncaughtException, which our handler then turns into
+        // process.exit(1). Net result: daemon silently dies the next
+        // time it tries to log, with no useful trace. Swallow EPIPE
+        // explicitly so the daemon stays alive when its terminal goes
+        // away (matching standard daemonization practice).
+        try {
+          // EPIPE: swallow (daemon must outlive its controlling terminal).
+          // Non-EPIPE (EIO, ENOSPC on redirected log, etc.): the listener
+          // already prevents 'error' from escalating to uncaughtException,
+          // so write a one-line trace to the *other* stream so operators
+          // can see the failure mode instead of finding a silent daemon.
+          process.stdout.on('error', function (err) {
+            if (err && err.code === 'EPIPE') return;
+            try { process.stderr.write('[evolver] stdout error: ' + (err && (err.code || err.message) || err) + '\n'); } catch (_) {}
+          });
+          process.stderr.on('error', function (err) {
+            if (err && err.code === 'EPIPE') return;
+            try { process.stdout.write('[evolver] stderr error: ' + (err && (err.code || err.message) || err) + '\n'); } catch (_) {}
+          });
+        } catch (_) {}
+
         const originalLog = console.log;
         const originalWarn = console.warn;
         const originalError = console.error;
         function ts() { return '[' + new Date().toISOString() + ']'; }
-        console.log = (...args) => { originalLog.call(console, ts(), ...args); };
-        console.warn = (...args) => { originalWarn.call(console, ts(), ...args); };
-        console.error = (...args) => { originalError.call(console, ts(), ...args); };
+        // Wrap originals in try/catch so a broken transport (closed pty,
+        // disk full on a redirected log file) cannot escape and trip
+        // unhandledException -> exit(1) the next time we log.
+        console.log = (...args) => {
+          try { originalLog.call(console, ts(), ...args); } catch (_) {}
+        };
+        console.warn = (...args) => {
+          try { originalWarn.call(console, ts(), ...args); } catch (_) {}
+        };
+        console.error = (...args) => {
+          try { originalError.call(console, ts(), ...args); } catch (_) {}
+        };
     }
 
     console.log('Starting evolver...');
@@ -274,26 +672,371 @@ async function main() {
     if (isLoop) {
         // Internal daemon loop (no wrapper required).
         if (!acquireLock()) process.exit(0);
+        // Round-9: refresh the lock lease so other processes can detect a
+        // crash / PID reuse via stale mtime instead of trusting kill(0).
+        startLockRefresh();
+
+        // Linux OOM score adjustment: lower oom_score_adj so the kernel
+        // deprioritises evolver when choosing an OOM victim. This is a
+        // best-effort hint -- the kernel can still kill us under extreme
+        // memory pressure, but we will not be the first target.
+        //
+        // Value -500 (range -1000..1000; -1000 = never kill, 0 = default,
+        // +1000 = kill first). -500 gives meaningful protection without
+        // reserving the slot for truly critical system services.
+        //
+        // Requires the process to be either root or to have CAP_SYS_RESOURCE.
+        // On most Docker/k8s images running as non-root this write will fail
+        // with EACCES -- that is expected and harmless; we log a one-liner so
+        // operators know to pass --oom-score-adj=-500 via their container spec,
+        // or to set /proc/<pid>/oom_score_adj from the supervising process.
+        //
+        // Users who want to set this from outside the process (safer, no CAP):
+        //   echo -500 > /proc/$(pgrep -f "node.*evolver.*--loop")/oom_score_adj
+        //
+        // Opt-out: EVOLVER_DISABLE_OOM_ADJUST=1
+        if (process.platform === 'linux' &&
+            String(process.env.EVOLVER_DISABLE_OOM_ADJUST || '') !== '1') {
+          try {
+            const _oomPath = '/proc/self/oom_score_adj';
+            const _oomTarget = '-500';
+            require('fs').writeFileSync(_oomPath, _oomTarget + '\n', 'utf8');
+            console.log('[evolver] Set Linux oom_score_adj=' + _oomTarget +
+              ' to reduce OOM-kill priority.');
+          } catch (oomErr) {
+            // EACCES under non-root / no CAP_SYS_RESOURCE is expected; EPERM
+            // inside stricter seccomp/apparmor profiles.  Both are non-fatal.
+            const oomCode = oomErr && oomErr.code ? oomErr.code : 'unknown';
+            console.log('[evolver] Could not set oom_score_adj (' + oomCode +
+              '). To protect evolver from OOM kill, run as root, add ' +
+              'CAP_SYS_RESOURCE, or set oom_score_adj externally via your ' +
+              'container spec (e.g. resources.requests + oom_score_adj in k8s).');
+          }
+        }
+
+        // Round-4: macOS App Nap / QoS demotion mitigation. Without this,
+        // a backgrounded `evolver --loop` running in an iTerm tab gets its
+        // process QoS demoted to UTILITY/BACKGROUND once the parent app
+        // is no longer focused. CPU runtime caps to ~5% of one core,
+        // setTimeout resolution drops toward 1 Hz, disk I/O is throttled.
+        // The drift detector cannot rescue this because the demotion does
+        // NOT cause Date.now() to jump -- only the inter-tick interval
+        // dilates, which the detector samples through its own (also
+        // demoted) setInterval. Net result: heartbeat appears alive but
+        // ticks fire so slowly that the hub marks the node offline,
+        // matching the user-reported "first launch ok -> idle -> dead
+        // forever" pattern.
+        //
+        // os.setPriority() raises BSD process priority; macOS bridges that
+        // to Mach thread QoS via the priority bridge so the demotion does
+        // not engage. -10 is the most negative value raisable without
+        // root. Failures are logged but non-fatal (e.g. EPERM under a
+        // restrictive sandbox -- the daemon continues, just unprotected).
+        // Opt-out via EVOLVER_DISABLE_PRIORITY_BOOST=1 for users on
+        // power-constrained battery profiles who would rather accept
+        // the throttle than the extra wake-time.
+        if (process.platform === 'darwin' &&
+            String(process.env.EVOLVER_DISABLE_PRIORITY_BOOST || '') !== '1') {
+          let priorityBoostOk = false;
+          try {
+            const os = require('os');
+            os.setPriority(0, -10);
+            // Round-5: actually verify the boost landed. macOS silently
+            // returns success from setPriority(2) under some sandboxes
+            // even when the underlying syscall was rejected by the
+            // Mach thread-policy bridge. Read it back; if the value is
+            // still 0 (or worse), App Nap will engage and the user
+            // sees the "first launch -> idle -> dead" symptom from
+            // round-3 with NO log evidence to RCA from.
+            const observed = os.getPriority();
+            if (observed <= -10) {
+              priorityBoostOk = true;
+              console.log('[evolver] Raised process priority on macOS to ' + observed +
+                ' to prevent App Nap / QoS demotion.');
+            } else {
+              console.warn('[evolver] setPriority(-10) reported success but observed priority is ' +
+                observed + '; App Nap protection NOT in effect. ' +
+                'Run with EVOLVER_CAFFEINATE=1 or via `caffeinate -is node index.js --loop`.');
+            }
+          } catch (e) {
+            console.warn('[evolver] setPriority(-10) refused (' + (e && e.code || 'unknown') +
+              '): ' + (e && e.message || e) + '. App Nap protection NOT in effect. ' +
+              'Run with EVOLVER_CAFFEINATE=1 or via `caffeinate -is node index.js --loop`.');
+          }
+          // Round-5: caffeinate side-child. Round-4 made this opt-in via
+          // EVOLVER_CAFFEINATE=1 to avoid the extra Activity-Monitor row;
+          // the round-5 audit found that 99% of users never set the env
+          // var, so the App Nap fallback was effectively unused. Promote
+          // to default-on when the priority boost did NOT land (so we
+          // either have priority or have caffeinate, never neither),
+          // unless the user has explicitly opted out via
+          // EVOLVER_CAFFEINATE=0. The combined effect: a fresh laptop
+          // user gets at least one layer of throttle protection without
+          // having to learn about either env var.
+          const caffeinateRaw = String(process.env.EVOLVER_CAFFEINATE || '').toLowerCase().trim();
+          const caffeinateOptedIn = caffeinateRaw === '1' || caffeinateRaw === 'true';
+          const caffeinateOptedOut = caffeinateRaw === '0' || caffeinateRaw === 'false';
+          const caffeinateFallback = !priorityBoostOk && !caffeinateOptedOut;
+          if (caffeinateOptedIn || caffeinateFallback) {
+            try {
+              const child = spawn('caffeinate', ['-i', '-w', String(process.pid)], {
+                detached: true,
+                stdio: 'ignore',
+              });
+              child.unref();
+              console.log('[evolver] Spawned caffeinate -i -w ' + process.pid +
+                ' to block App Nap (pid ' + child.pid + ').' +
+                (caffeinateFallback ? ' (fallback because priority boost was refused)' : ''));
+            } catch (e) {
+              console.warn('[evolver] caffeinate spawn failed: ' +
+                (e && e.message || e) + '. App Nap may throttle the heartbeat. ' +
+                'Install caffeinate (Xcode CLT) or run under a launchd plist with NSAppSleepDisabled=1.');
+            }
+          }
+        }
+
+        // Event-loop keep-alive anchor (defense-in-depth for the sleepMs fix).
+        //
+        // All timers in a2aProtocol.js (heartbeat, drift detector, self-driving
+        // poll, SSE reconnect) are unref'd so they never prevent a clean exit.
+        // The sleepMs() timer above is now ref'd (the primary fix), but as an
+        // additional safety net we install one ref'd setInterval here that fires
+        // every 10 minutes. Its only job is to emit a lightweight log line so
+        // the evolver_loop.log gets touched even when the daemon is completely
+        // idle (no session signals, evolve cycle sleeping at maxSleepMs). This
+        // guarantees the event loop has at least one ref'd handle at all times
+        // while the daemon is running, and provides a heartbeat-on-disk so
+        // lifecycle.checkHealth() (MAX_SILENCE_MS = 30 min default) does not
+        // wrongly declare the process stagnant during legitimate long idle windows.
+        // Cleared in shutdown() so it does not outlive the daemon.
+        const _KEEPALIVE_INTERVAL_MS = 10 * 60 * 1000;
+        let _keepAliveTimer = setInterval(function () {
+          try {
+            // Inline append that mirrors a2aProtocol._appendHeartbeatLog's
+            // ENOENT-retry (that helper is not exported).
+            const a2aKA = require('./src/gep/a2aProtocol');
+            if (typeof a2aKA.getHeartbeatStats === 'function') {
+              const s = a2aKA.getHeartbeatStats();
+              const { getEvolverLogPath } = require('./src/gep/paths');
+              const fsKA = require('fs');
+              const pathKA = require('path');
+              try {
+                const logPath = getEvolverLogPath();
+                fsKA.mkdirSync(pathKA.dirname(logPath), { recursive: true });
+                const line = JSON.stringify({
+                  ts: new Date().toISOString(),
+                  type: 'keepalive_tick',
+                  hb_running: s.running,
+                  hb_last_tick_ago_s: s.lastTickAt ? Math.round((Date.now() - s.lastTickAt) / 1000) : null,
+                }) + '\n';
+                try {
+                  fsKA.appendFileSync(logPath, line, { encoding: 'utf8' });
+                } catch (e) {
+                  if (e && e.code === 'ENOENT') {
+                    try {
+                      fsKA.mkdirSync(pathKA.dirname(logPath), { recursive: true });
+                      fsKA.appendFileSync(logPath, line, { encoding: 'utf8' });
+                    } catch (_) { /* log destination broken; do not throw out */ }
+                  }
+                }
+              } catch (_) { /* never let the log write kill the timer */ }
+            }
+          } catch (_) { /* never let any error kill the keep-alive timer */ }
+        }, _KEEPALIVE_INTERVAL_MS);
+        // Intentionally ref'd: this is the explicit event-loop anchor.
+        // Do NOT add .unref() here -- that would defeat the purpose.
+
         function shutdown() {
+          if (_keepAliveTimer) { clearInterval(_keepAliveTimer); _keepAliveTimer = null; }
+          stopLockRefresh();
           releaseLock();
+          // stopHeartbeat() clears the drift detector interval and the heartbeat
+          // timer, preventing "ghost tick" log noise after exit and ensuring a
+          // clean state if the process is somehow continued (test harness, etc.).
+          try { require('./src/gep/a2aProtocol').stopHeartbeat(); } catch (e) {}
           try { require('./src/gep/a2aProtocol').stopEventStream(); } catch (e) {}
         }
         process.on('exit', shutdown);
         process.on('SIGINT', () => { shutdown(); process.exit(); });
         process.on('SIGTERM', () => { shutdown(); process.exit(); });
+        // SIGHUP: two meanings depending on platform and how the daemon was started.
+        //
+        // macOS / interactive terminal: closing the iTerm/Terminal tab sends
+        // SIGHUP to the controlling process, and Node's default action is to
+        // terminate. That is the most common "first-launch, then idle, then
+        // evolver dead" path on macOS. As a daemon we intentionally ignore it.
+        //
+        // Linux systemd: `systemctl reload evolver` delivers SIGHUP to signal
+        // configuration reload. The socket / connection state may be stale (e.g.
+        // the hub URL changed in .env, or the admin wants a fresh hello after a
+        // manual secret rotation). We treat reload as a soft wake-recovery: drain
+        // the undici pool, poke the heartbeat, and restart the SSE stream, which
+        // is identical to what SIGCONT / the drift detector do on system resume.
+        // We also emit sd_notify RELOADING=1 / READY=1 so systemd can track the
+        // reload state (required for Type=notify units that call systemctl reload).
+        //
+        // A one-shot (non --loop) invocation keeps the default behavior because
+        // this branch is gated on `isLoop`.
+        process.on('SIGHUP', () => {
+          try {
+            if (process.platform === 'linux') {
+              // On Linux, SIGHUP from systemd means reload, not terminal close.
+              // Announce reload state to the service manager first so systemd
+              // does not time out waiting, then perform the recovery, then signal
+              // READY=1 again to confirm we are back in steady state.
+              try {
+                const a2aForSd = require('./src/gep/a2aProtocol.js');
+                if (typeof a2aForSd._sdNotify === 'function') {
+                  // MONOTONIC_USEC requires microseconds from the monotonic clock.
+                  // process.hrtime() returns [sec, nsec] from a fixed epoch;
+                  // avoids BigInt literals for Node <10.3 compatibility.
+                  const _hrt = process.hrtime();
+                  const _monUsec = _hrt[0] * 1000000 + Math.floor(_hrt[1] / 1000);
+                  a2aForSd._sdNotify('RELOADING=1\nMONOTONIC_USEC=' + _monUsec);
+                }
+              } catch (_) {}
+              console.warn('[evolver] Received SIGHUP on Linux (systemctl reload?). ' +
+                'Running wake recovery (drain pool + poke heartbeat + restart SSE). ' +
+                'To stop the daemon use SIGINT/SIGTERM.');
+              try {
+                const a2a = require('./src/gep/a2aProtocol.js');
+                if (typeof a2a._runWakeRecovery === 'function') a2a._runWakeRecovery();
+              } catch (_) {}
+              // Interrupt any pending sleepMs so the evolve loop picks up
+              // immediately after the reload rather than sitting out its window.
+              try { _interruptAllSleeps(); } catch (_) {}
+              // Signal READY=1 to close the RELOADING window. systemd will mark
+              // the reload complete once it sees this notification.
+              try {
+                const a2aForSd2 = require('./src/gep/a2aProtocol.js');
+                if (typeof a2aForSd2._sdNotify === 'function') {
+                  a2aForSd2._sdNotify('READY=1');
+                }
+              } catch (_) {}
+            } else {
+              // macOS / non-systemd: terminal-close semantics, ignore the signal.
+              console.warn('[evolver] Received SIGHUP (controlling terminal closed?). ' +
+                'Daemon ignoring -- heartbeat loop continues. To stop the daemon use SIGINT/SIGTERM.');
+            }
+          } catch (_) {}
+        });
+        // SIGCONT fires on `kill -CONT`, debugger detach, and some VM/sleep
+        // resume paths. Nudge the heartbeat loop so it doesn't sit waiting for
+        // its next scheduled tick (which could be up to 30 min away under
+        // backoff) before reconnecting after a wake event. Also restart the
+        // SSE stream: the underlying TCP socket almost certainly died during
+        // the SIGSTOP window without a FIN reaching us, and the existing
+        // exponential reconnect could be up to 120s away on the resumed
+        // monotonic clock.
+        // Round-6 (§19.5): register process-level wake hooks so both the
+        // SIGCONT handler and the drift detector's long-sleep branch
+        // (a2aProtocol) interrupt the outer evolve sleepMs and poke the
+        // validator daemon, not just the heartbeat-internal recovery.
+        _registerProcessWakeHooks();
+        // SIGCONT is not supported on Windows (process.on() throws ERR_UNKNOWN_SIGNAL).
+        // Wake recovery on Windows is handled exclusively by the drift detector.
+        if (process.platform !== 'win32') {
+          process.on('SIGCONT', () => {
+            // Real recovery delegates to a2aProtocol._runWakeRecovery so
+            // SIGCONT and the drift detector share one code path. NOTE:
+            // per followups §18.2, SIGCONT is never sent by the macOS
+            // kernel on system wake; this handler primarily covers:
+            //   - hypervisor/docker resume (container unpause)
+            //   - `kill -CONT <pid>` from operators or supervisors
+            //   - Linux debugger attach/detach (ptrace SIGSTOP+SIGCONT;
+            //     on Linux this is a true job-control signal unlike macOS)
+            //   - `docker unpause` (sends SIGCONT to all cgroup processes)
+            // Bare-metal macOS wake recovery is driven by the drift
+            // detector only. _runWakeRecovery() has a 1s debounce gate so
+            // a rapid burst (e.g. gdb repeatedly attaching) collapses into
+            // one recovery without leaking undici agents or SSE connections.
+            try {
+              const a2a = require('./src/gep/a2aProtocol.js');
+              if (typeof a2a._runWakeRecovery === 'function') a2a._runWakeRecovery();
+            } catch (_) {}
+          });
+        }
         process.on('uncaughtException', (err) => {
           console.error('[FATAL] Uncaught exception:', err && err.stack ? err.stack : String(err));
           releaseLock();
           process.exit(1);
         });
         // Sliding window: only exit if many rejections cluster in a short
-        // period. A daemon running for weeks can accumulate harmless,
-        // unrelated rejections (transient network blips, hub timeouts);
-        // the original cumulative counter would eventually kill the
-        // process for noise. Cluster = real failure cascade.
+        // period AND the daemon shows no other signs of life. A daemon
+        // running for weeks can accumulate harmless, unrelated rejections
+        // (transient network blips, hub timeouts); the original cumulative
+        // counter would eventually kill the process for noise. Cluster =
+        // real failure cascade. But macOS wake bursts also synthesize
+        // clusters: heartbeat / SSE / validator / merchantAgent / ATP all
+        // fire near-simultaneously on resume and any subsystem with an
+        // unhandled async-callback throw can blow past 5 rejections in
+        // seconds. We add a liveness gate so an actively-recovering
+        // daemon doesn't kill itself in the middle of a wake-recovery
+        // storm. Threshold and window widened to match the macOS-wake
+        // amplification observed in round-2 testing.
         const REJECTION_WINDOW_MS = 5 * 60 * 1000;
-        const REJECTION_THRESHOLD = 5;
+        const REJECTION_THRESHOLD = 10;
+        const RECENT_LIVENESS_MS = 60 * 1000;
         let _rejectionTimestamps = [];
+        function _heartbeatLooksAlive() {
+          // Round-6 (§19.8): the previous implementation reached into
+          // the `_testing` namespace and returned false (= "treat as
+          // dead, exit on cluster") if that test-only accessor was
+          // unavailable. Under bundling / minification / a future
+          // refactor that drops the `_testing` export, this turned a
+          // recovery storm into a guaranteed exit -- the OPPOSITE of
+          // what the gate exists to do. Switched to the public
+          // getHeartbeatStats() API (which surfaces `running` and
+          // `lastTickAt` for exactly this purpose) and made the
+          // require failure path "fail open" -- assume alive so we
+          // don't kill an actively-recovering daemon just because the
+          // module load failed on this turn.
+          //
+          // Round-10: `running` + recent `lastTickAt` alone are not
+          // enough to claim "alive." `lastTickAt` is stamped at the
+          // TOP of every heartbeat tick, regardless of whether the
+          // tick actually makes progress -- including ticks that
+          // immediately bail out because the loop is spinning in a
+          // reauth backoff window (see a2aProtocol.js getHeartbeatStats
+          // comment near :2940, which acknowledges that the loop
+          // showed `running: true, lastTickAt: <recent>` even when
+          // silent for 30 min waiting on a reauth backoff). In that
+          // state a rejection cascade originating OUTSIDE the
+          // heartbeat would be repeatedly forgiven while the loop is
+          // not actually making forward progress. Require additionally
+          // that `consecutiveFailures === 0` and that we are not
+          // currently inside a reauth backoff window, so "alive" means
+          // "making progress," not just "ticking."
+          //
+          // Trade-off: a transient hub blip that bumps
+          // `consecutiveFailures` to 1 will now NOT forgive a
+          // concurrent rejection cascade. That is intentional --
+          // cascade-forgiveness exists to avoid flapping during a
+          // healthy loop; during an unhealthy loop we should not keep
+          // absorbing rejections silently.
+          try {
+            const a2a = require('./src/gep/a2aProtocol.js');
+            if (!a2a || typeof a2a.getHeartbeatStats !== 'function') {
+              // Cannot read state -- fail open. A real wedged daemon
+              // will be caught by the next rejection if/when stats
+              // become available, or by other watchdogs.
+              return true;
+            }
+            const s = a2a.getHeartbeatStats();
+            if (!s || !s.running) return false;
+            const last = s.lastTickAt || 0;
+            if (!(last > 0 && (Date.now() - last) < RECENT_LIVENESS_MS)) return false;
+            // Round-10: gate on success state, not just tick freshness.
+            if ((s.consecutiveFailures || 0) > 0) return false;
+            if ((s.reauthBackoffUntil || 0) > Date.now()) return false;
+            return true;
+          } catch (_) {
+            // Module load threw -- fail open for the same reason as
+            // above. A genuinely broken require would surface via
+            // uncaughtException long before this gate matters.
+            return true;
+          }
+        }
         process.on('unhandledRejection', (reason) => {
           const now = Date.now();
           _rejectionTimestamps.push(now);
@@ -302,7 +1045,15 @@ async function main() {
           });
           console.error('[FATAL] Unhandled promise rejection (' + _rejectionTimestamps.length + ' in window):', reason && reason.stack ? reason.stack : String(reason));
           if (_rejectionTimestamps.length >= REJECTION_THRESHOLD) {
-            console.error('[FATAL] ' + _rejectionTimestamps.length + ' unhandled rejections within ' + (REJECTION_WINDOW_MS / 1000) + 's. Exiting to avoid corrupt state.');
+            if (_heartbeatLooksAlive()) {
+              console.warn('[FATAL] ' + _rejectionTimestamps.length + ' rejections within ' +
+                (REJECTION_WINDOW_MS / 1000) + 's BUT heartbeat ticked in the last ' +
+                (RECENT_LIVENESS_MS / 1000) + 's. Treating as recovery storm, not exiting. ' +
+                'Resetting rejection window so a real subsequent cascade can still trip the trap.');
+              _rejectionTimestamps = [];
+              return;
+            }
+            console.error('[FATAL] ' + _rejectionTimestamps.length + ' unhandled rejections within ' + (REJECTION_WINDOW_MS / 1000) + 's and no recent heartbeat activity. Exiting to avoid corrupt state.');
             releaseLock();
             process.exit(1);
           }
@@ -508,10 +1259,29 @@ async function main() {
           if (consent.enabled) {
             const hubUrl = process.env.A2A_HUB_URL || process.env.EVOMAP_HUB_URL || '';
             if (hubUrl) {
-              autoBuyer.start({
-                dailyCap: Number(process.env.ATP_AUTOBUY_DAILY_CAP_CREDITS) || undefined,
-                perOrderCap: Number(process.env.ATP_AUTOBUY_PER_ORDER_CAP_CREDITS) || undefined,
-              });
+              // Round-5: previously this bare start() call was a true
+              // fire-and-forget. If autoBuyer.start returned a rejected
+              // promise (transient hub error, bad config, mid-wake DNS
+              // flap), the unhandledRejection escaped to the
+              // process-level handler -- which, post round-3, only
+              // exits if heartbeat is also dead. Net effect: daemon
+              // stays alive but the autobuyer is half-initialized and
+              // silently ignores claims. Attach a catch so the
+              // operator can see the failure and the daemon-survival
+              // gate is not relied on.
+              try {
+                const _autoBuyerPromise = autoBuyer.start({
+                  dailyCap: Number(process.env.ATP_AUTOBUY_DAILY_CAP_CREDITS) || undefined,
+                  perOrderCap: Number(process.env.ATP_AUTOBUY_PER_ORDER_CAP_CREDITS) || undefined,
+                });
+                if (_autoBuyerPromise && typeof _autoBuyerPromise.catch === 'function') {
+                  _autoBuyerPromise.catch(function (abErr) {
+                    console.warn('[ATP-AutoBuyer] start() rejected: ' + (abErr && abErr.message || abErr));
+                  });
+                }
+              } catch (abSyncErr) {
+                console.warn('[ATP-AutoBuyer] start() threw synchronously: ' + (abSyncErr && abSyncErr.message || abSyncErr));
+              }
               if (consent.source === 'default') {
                 // First-run on a non-TTY (daemon, hook, CI) where the prompt
                 // could not fire AND no env override + no ack file. autoBuyer
@@ -538,9 +1308,19 @@ async function main() {
             const hubUrl = process.env.A2A_HUB_URL || process.env.EVOMAP_HUB_URL || '';
             if (hubUrl) {
               const autoDeliver = require('./src/atp/autoDeliver');
-              autoDeliver.start({
-                pollMs: Number(process.env.ATP_AUTODELIVER_POLL_MS) || undefined,
-              });
+              // Round-5: same fire-and-forget hardening as autoBuyer above.
+              try {
+                const _autoDeliverPromise = autoDeliver.start({
+                  pollMs: Number(process.env.ATP_AUTODELIVER_POLL_MS) || undefined,
+                });
+                if (_autoDeliverPromise && typeof _autoDeliverPromise.catch === 'function') {
+                  _autoDeliverPromise.catch(function (adErr) {
+                    console.warn('[ATP-AutoDeliver] start() rejected: ' + (adErr && adErr.message || adErr));
+                  });
+                }
+              } catch (adSyncErr) {
+                console.warn('[ATP-AutoDeliver] start() threw synchronously: ' + (adSyncErr && adSyncErr.message || adSyncErr));
+              }
             } else {
               console.warn('[ATP-AutoDeliver] autodeliver enabled but no hub URL configured, skipping.');
             }
@@ -1117,6 +1897,10 @@ async function main() {
 
     try {
       if (!getHubNodeSecret()) {
+        // Round-7 (§20.7): if a daemon is up and we have no secret, we
+        // would race the daemon's hello and silently corrupt its
+        // node_secret. Refuse cleanly with a hint instead.
+        refuseHelloIfDaemonRunning('fetch');
         console.log('[fetch] No node_secret found. Sending hello to Hub to register...');
         const helloResult = await sendHelloToHub();
         if (!helloResult || !helloResult.ok) {
@@ -1324,6 +2108,9 @@ async function main() {
 
     try {
       if (!getHubNodeSecret()) {
+        // Round-7 (§20.7): refuse a fresh hello if a live daemon owns
+        // the lock; the daemon's secret will appear shortly.
+        refuseHelloIfDaemonRunning('sync');
         console.log('[sync] No node_secret found. Sending hello to Hub to register...');
         const helloResult = await sendHelloToHub();
         if (!helloResult || !helloResult.ok) {
@@ -1750,7 +2537,13 @@ async function main() {
     //                   we just print the unset hint)
     const path = require('path');
     const fs = require('fs');
-    const home = process.env.HOME || require('os').homedir();
+    // Honor an explicit HOME override (used by tests to redirect to a fake
+    // home) before falling back to os.homedir(). On POSIX, os.homedir() also
+    // reads $HOME first, so this is a no-op in practice on macOS/Linux. On
+    // Windows, os.homedir() reads %USERPROFILE% and ignores HOME -- without
+    // this fallback, test/resetLocalSecret.test.js cannot inject a fake home
+    // and the reset operates on the real user dir.
+    const home = process.env.HOME || os.homedir();
     const stateFile = path.join(home, '.evomap', 'mailbox', 'state.json');
     const legacyFile = path.join(home, '.evomap', 'node_secret');
     let cleared = 0;
@@ -1796,6 +2589,18 @@ async function main() {
     // Invoked by a spawned Cursor sub-session after it has written the ATP
     // task answer to a file. Drives publish -> task/complete -> atp/deliver.
     try {
+      // Round-8 (§21.8): if a daemon is up and the spawned subsession
+      // somehow has no secret on disk, the inner completeAtpTask ->
+      // _ensureNodeSecret -> sendHelloToHub call would race the
+      // daemon's hello and silently corrupt the daemon's node_secret
+      // (same vector round-7 §20.7 closed for fetch/sync). In the
+      // common happy path the daemon already registered, the secret
+      // exists, the guard is a no-op. Imported lazily so the helper
+      // resolution does not slow down unrelated subcommands.
+      try {
+        const { getHubNodeSecret } = require('./src/gep/a2aProtocol');
+        if (!getHubNodeSecret()) refuseHelloIfDaemonRunning('atp-complete');
+      } catch (_) { /* never block ATP completion on a guard error */ }
       const subArgs = args.slice(1);
       function flag(name) {
         const pref = '--' + name + '=';
@@ -1833,6 +2638,16 @@ async function main() {
 
   } else if (command === 'buy' || command === 'orders' || command === 'verify' || command === 'atp') {
     try {
+      // Round-8 (§21.8): same daemon-vs-CLI race protection as fetch/sync
+      // and atp-complete. The ATP runners (consumerAgent / merchantAgent
+      // / atpExecute) all call sendHelloToHub when getHubNodeSecret() is
+      // empty, which clobbers a running daemon's secret and silences it
+      // for 30 min..4 h. The check is a no-op when a secret already
+      // exists (the common case once the daemon has registered).
+      try {
+        const { getHubNodeSecret } = require('./src/gep/a2aProtocol');
+        if (!getHubNodeSecret()) refuseHelloIfDaemonRunning(command);
+      } catch (_) { /* never block ATP CLI on a guard error */ }
       const atpCli = require('./src/atp/cli');
       const subArgs = args.slice(1); // drop the command token (e.g. "buy") itself
       let parsed;

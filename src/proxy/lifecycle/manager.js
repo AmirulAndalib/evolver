@@ -23,11 +23,29 @@ const HEARTBEAT_BACKOFF_CAP_MS = 15 * 60_000;
 const HELLO_TIMEOUT = 15_000;
 const HEARTBEAT_TIMEOUT = 10_000;
 const MAX_REAUTH_ATTEMPTS = 2;
-// First failure = 30 min, subsequent consecutive failures double up to ~4h.
-// Without escalation a daemon stuck on a bad secret gets re-poked every 30
-// minutes by inbound auth errors and fills the log forever.
-const REAUTH_BACKOFF_BASE_MS = 30 * 60_000;
+// First failure = 2 min, subsequent consecutive failures double up to ~4h.
+// Aligned with a2aProtocol.js Round-9 reduction (was 30 min, caused
+// "idle-death" for proxy-mode users: one benign 401 silenced the node for 30
+// min, triggering stagnation kills and manual restart loops).
+const REAUTH_BACKOFF_BASE_MS = 2 * 60_000;
 const REAUTH_BACKOFF_MAX_MS = 4 * 60 * 60_000;
+
+// Wall-clock drift detector tunables. Mirrors DRIFT_CHECK_MS /
+// DRIFT_SLEEP_THRESHOLD_MS / DRIFT_LONG_SLEEP_THRESHOLD_MS in
+// src/gep/a2aProtocol.js. setTimeout / setInterval fire on libuv's
+// monotonic clock, which freezes while the host is suspended -- so a
+// laptop closed for hours and reopened would not trigger any heartbeat
+// tick until the next scheduled time, which under exponential backoff
+// can sit at HEARTBEAT_BACKOFF_CAP_MS (15 min). Sampling Date.now()
+// (wall clock) every DRIFT_CHECK_MS lets us detect the jump and
+// immediately poke the heartbeat so recovery does not have to wait for
+// the next natural tick. Long-sleep gap also clears reauth backoff:
+// hub-side state we cached is almost certainly stale after a 30min+
+// suspend, so force a clean retry path on wake instead of carrying the
+// pre-sleep penalty through. R10 (#544).
+const DRIFT_CHECK_MS = 30 * 1000;
+const DRIFT_SLEEP_THRESHOLD_MS = 90 * 1000;
+const DRIFT_LONG_SLEEP_THRESHOLD_MS = 30 * 60_000;
 
 let _cachedFingerprint = null;
 function _getEnvFingerprint() {
@@ -101,6 +119,8 @@ class LifecycleManager {
     this._helloRateLimitUntil = 0;
     this._reauthBackoffUntil = 0;
     this._consecutiveReauthFailures = 0;
+    this._driftInterval = null;
+    this._lastDriftCheckAt = 0;
   }
 
   get nodeId() {
@@ -510,6 +530,55 @@ class LifecycleManager {
     // to schedule its own next timer (a fresher path already owns it).
     this._heartbeatGen = (this._heartbeatGen || 0) + 1;
     this._heartbeatTick(this._heartbeatGen);
+    this._startDriftDetector();
+  }
+
+  // Sample wall-clock every DRIFT_CHECK_MS so macOS sleep / hypervisor
+  // pause / debugger break is detected and the heartbeat loop is poked
+  // back into action without waiting for the (possibly 15-min) backoff
+  // timer to fire on libuv's monotonic clock. R10 (#544).
+  _startDriftDetector() {
+    if (this._driftInterval) return;
+    this._lastDriftCheckAt = Date.now();
+    this._driftInterval = setInterval(() => {
+      // Wrap the whole body in try/catch -- this is a setInterval
+      // callback; any throw escaping it kills the detector itself,
+      // which is the bug we're protecting against.
+      try {
+        if (!this._running) return;
+        const now = Date.now();
+        const gap = now - this._lastDriftCheckAt;
+        this._lastDriftCheckAt = now;
+        if (gap > DRIFT_SLEEP_THRESHOLD_MS) {
+          try {
+            this.logger.warn(
+              `[lifecycle] wall-clock jump detected (+${Math.round(gap / 1000)}s); ` +
+                'likely sleep/wake or process suspension, poking heartbeat'
+            );
+          } catch (_) { /* logger broken; detector must still poke */ }
+          // Long-sleep recovery: the hub-side cached state we carried
+          // through the suspend is almost certainly stale. Clear reauth
+          // backoff so the next tick can try a clean recovery path
+          // instead of sitting out a pre-sleep penalty for up to 4h.
+          if (gap > DRIFT_LONG_SLEEP_THRESHOLD_MS) {
+            this._consecutiveReauthFailures = 0;
+            this._reauthBackoffUntil = 0;
+            try {
+              this.logger.warn(
+                `[lifecycle] long sleep (+${Math.round(gap / 60_000)}min) cleared reauth backoff`
+              );
+            } catch (_) { /* logger broken; non-fatal */ }
+          }
+          this.pokeHeartbeatLoop();
+        }
+      } catch (err) {
+        try { this.logger.error(`[lifecycle] drift detector threw: ${err && err.message}`); }
+        catch (_) { /* never let the detector escape */ }
+      }
+    }, DRIFT_CHECK_MS);
+    // Don't keep the event loop alive on behalf of the detector alone --
+    // matches the unref() used on _heartbeatTimer.
+    if (this._driftInterval.unref) this._driftInterval.unref();
   }
 
   async _heartbeatTick(myGen) {
@@ -573,6 +642,10 @@ class LifecycleManager {
     if (this._heartbeatTimer) {
       clearTimeout(this._heartbeatTimer);
       this._heartbeatTimer = null;
+    }
+    if (this._driftInterval) {
+      clearInterval(this._driftInterval);
+      this._driftInterval = null;
     }
   }
 

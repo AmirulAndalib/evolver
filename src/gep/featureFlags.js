@@ -43,6 +43,10 @@ function _loadFromDisk() {
 }
 
 function _writeToDisk(obj) {
+  // NOTE(windows): mode 0o700 / 0o600 are silently ignored on Windows.
+  // Feature-flag files will NOT be owner-only on Windows; they are protected
+  // only by user-profile directory ACLs. This is acceptable as feature flags
+  // are not security-critical secrets.
   try {
     const dir = _flagsDir();
     if (!fs.existsSync(dir)) {

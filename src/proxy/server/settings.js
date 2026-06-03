@@ -37,9 +37,13 @@ function writeSettings(data) {
   }
   const current = readSettings();
   const merged = { ...current, ...data };
+  // NOTE(windows): mode 0o600 is silently ignored on Windows. The settings
+  // file (which may contain proxy credentials) will NOT be owner-read-only.
+  // Only Windows user-profile directory ACLs provide isolation. The chmodSync
+  // call below is also a no-op on Windows but is retained for Unix correctness.
   fs.writeFileSync(file, JSON.stringify(merged, null, 2), { encoding: 'utf8', mode: 0o600 });
   // mode: 0o600 only applies on creation; explicitly chmod to tighten pre-existing files
-  try { fs.chmodSync(file, 0o600); } catch {}
+  try { fs.chmodSync(file, 0o600); } catch { /* best-effort; no-op on Windows */ }
   return merged;
 }
 
@@ -59,9 +63,19 @@ function isStaleProxy() {
   const pid = settings.proxy?.pid;
   if (!pid) return false;
   try {
+    // process.kill(pid, 0) probes whether the process exists without sending a
+    // signal. On POSIX it throws ESRCH when the PID is gone. On Windows the
+    // Node.js runtime maps this to the same behavior (ESRCH via uv_kill), so
+    // the cross-platform semantics are consistent. If the current process does
+    // not have permission to query the target PID, EPERM is thrown -- that
+    // means the PID exists and is owned by another user, so we treat it as
+    // live (not stale) rather than crashing.
     process.kill(pid, 0);
     return false;
-  } catch {
+  } catch (err) {
+    // ESRCH: process does not exist -> stale.
+    // EPERM: process exists but is not ours -> not stale (leave settings alone).
+    if (err.code === 'EPERM') return false;
     return true;
   }
 }

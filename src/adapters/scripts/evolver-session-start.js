@@ -10,6 +10,100 @@ const os = require('os');
 const { findEvolverRoot, findMemoryGraph, resolveProjectDir, resolveWorkspaceId, isGitWorkspace } = require('./_runtimePaths');
 const { filterRelevantOutcomes } = require('./_memoryFiltering');
 
+// Auto-restart guard: if the evolver daemon is not running when a new agent
+// session starts, attempt a background restart. This covers the "idle-death"
+// scenario: the user closed the machine (macOS sleep), the process died due to
+// event-loop exhaustion or OOM, and now the next agent session finds it gone.
+// We delegate to lifecycle.js restart() which is idempotent (no-op if already
+// running), detached (does not block session startup), and captures output in
+// the existing evolver log.
+//
+// Guard-rails:
+//   - Only runs when EVOLVER_SESSION_AUTO_RESTART is not "0" or "false".
+//   - Skips gracefully if lifecycle.js cannot be found (non-daemon setups,
+//     npx one-shot mode, etc.).
+//   - Execution errors are swallowed: this must never cause session-start to
+//     error out or delay the LLM context injection.
+function _maybeRestartDaemon(evolverRoot) {
+  try {
+    var autoRestart = String(process.env.EVOLVER_SESSION_AUTO_RESTART || '1').toLowerCase().trim();
+    if (autoRestart === '0' || autoRestart === 'false') return;
+
+    var lifecyclePath = evolverRoot
+      ? path.join(evolverRoot, 'src', 'ops', 'lifecycle.js')
+      : null;
+    if (!lifecyclePath || !fs.existsSync(lifecyclePath)) return;
+
+    // Check if daemon is running by looking for the PID file / lock file.
+    // R12: index.js:getLockFilePath honors EVOLVER_LOCK_DIR. If that env is
+    // set the lock file lives at <EVOLVER_LOCK_DIR>/evolver.pid (basename
+    // differs from the default!); otherwise fall back to the canonical
+    // ~/.evomap/instance.lock. We replicate the logic inline rather than
+    // importing index.js, since pulling the daemon module into the hook
+    // would load far more than we need.
+    var lockFile = process.env.EVOLVER_LOCK_DIR
+      ? path.join(process.env.EVOLVER_LOCK_DIR, 'evolver.pid')
+      : path.join(os.homedir(), '.evomap', 'instance.lock');
+    // R1: PID-reuse defense. process.kill(pid, 0) only proves SOME process
+    // owns that PID -- after macOS sleep / OOM, the kernel may have reused
+    // the slain daemon's PID for an unrelated process (Chrome tab, shell).
+    // Mirror index.js:_lockIsStaleByLease (search for STALE_LOCK_TTL_MS
+    // around line 373): a lease-aware daemon refreshes the lock mtime on a
+    // timer, so if mtime is older than the TTL the daemon is dead/wedged
+    // regardless of kill(0). Constants inlined to keep index.js out of the
+    // hook's require graph.
+    var STALE_LOCK_TTL_MS = process.platform === 'win32' ? 3 * 60_000 : 5 * 60_000;
+    var daemonRunning = false;
+    try {
+      if (fs.existsSync(lockFile)) {
+        var raw = fs.readFileSync(lockFile, 'utf8').trim();
+        var payload = raw && raw[0] === '{' ? JSON.parse(raw) : { pid: parseInt(raw, 10) };
+        if (payload && payload.pid > 0) {
+          try { process.kill(payload.pid, 0); daemonRunning = true; } catch (e) {
+            // EPERM = process exists but owned by a different user; still a live daemon.
+            if (e && e.code === 'EPERM') daemonRunning = true;
+          }
+          // Lease staleness overrides kill(0)=alive. Only trust mtime when
+          // the payload came from a lease-aware daemon (matches index.js's
+          // _lockIsStaleByLease guard) so we never falsely steal an older
+          // pre-lease daemon's lock.
+          if (daemonRunning && payload.lease === true) {
+            try {
+              var ageMs = Date.now() - fs.statSync(lockFile).mtimeMs;
+              if (ageMs > STALE_LOCK_TTL_MS) daemonRunning = false;
+            } catch (_) { /* stat failed: leave running flag as-is */ }
+          }
+        }
+      }
+    } catch (_) { /* lock file unreadable or absent: assume not running */ }
+
+    if (daemonRunning) return; // already alive, nothing to do
+
+    // Daemon appears dead. Spawn lifecycle.js start in the background so
+    // this session-start script exits immediately (< 50 ms) and does not
+    // block the LLM from getting context.
+    var { spawn } = require('child_process');
+    var child = spawn(
+      process.execPath,
+      [lifecyclePath, 'start'],
+      {
+        detached: true,
+        stdio: 'ignore',
+        cwd: evolverRoot,
+        env: Object.assign({}, process.env),
+      }
+    );
+    child.unref();
+    // Best-effort: log a single-line note to stderr so the session transcript
+    // shows that a restart was attempted, without affecting stdout JSON output.
+    try {
+      process.stderr.write('[evolver-session-start] Daemon was not running; attempted background restart (PID ' + child.pid + ').\n');
+    } catch (_) {}
+  } catch (_) {
+    // Never let this helper block or crash the session-start script.
+  }
+}
+
 // One-line notice shown (throttled) when the workspace is not a git repo.
 // Evolver derives every outcome from the git diff, so in a non-git folder the
 // session-end hook records nothing — silently, unless we say so here. We surface
@@ -167,6 +261,12 @@ function main() {
   }
 
   const evolverRoot = findEvolverRoot();
+
+  // Attempt to restart the daemon in the background if it has died since the
+  // last session (idle-death / macOS sleep / OOM). Fire-and-forget: errors are
+  // swallowed and this never delays the JSON output below.
+  _maybeRestartDaemon(evolverRoot);
+
   const graphPath = findMemoryGraph(evolverRoot);
 
   // Scope to the current workspace BEFORE trimming to the most-recent window,
