@@ -14,6 +14,8 @@ if (!process.env.A2A_NODE_SECRET) {
 const forceUpdatePath = require.resolve('../src/forceUpdate');
 let executeForceUpdateCalls = [];
 let executeForceUpdateReturn = false;
+let executeForceUpdateReturns = [];
+const SPY_NOOP = Symbol('SPY_FORCE_UPDATE_NOOP');
 require.cache[forceUpdatePath] = {
   id: forceUpdatePath,
   filename: forceUpdatePath,
@@ -21,8 +23,10 @@ require.cache[forceUpdatePath] = {
   exports: {
     executeForceUpdate: function (fu) {
       executeForceUpdateCalls.push(fu);
+      if (executeForceUpdateReturns.length > 0) return executeForceUpdateReturns.shift();
       return executeForceUpdateReturn;
     },
+    FORCE_UPDATE_NOOP: SPY_NOOP,
   },
 };
 
@@ -67,6 +71,7 @@ describe('heartbeat-triggered force_update', () => {
   beforeEach(() => {
     executeForceUpdateCalls = [];
     executeForceUpdateReturn = false;
+    executeForceUpdateReturns = [];
     exitCalls = [];
     process.exit = function (code) { exitCalls.push(code); };
     // Default: cooldown 0 so each test starts fresh. The cooldown test
@@ -159,5 +164,36 @@ describe('heartbeat-triggered force_update', () => {
     // in-flight lock / recent-attempt cooldown).
     assert.equal(executeForceUpdateCalls.length, 1,
       'second back-to-back heartbeat must not re-trigger executeForceUpdate');
+  });
+
+  it('does not let a no-op force_update consume cooldown for a later higher version', async () => {
+    process.env.EVOLVER_FORCE_UPDATE_RETRY_COOLDOWN_MS = '3600000';
+    executeForceUpdateReturns = [SPY_NOOP, false];
+    var heartbeatCount = 0;
+    global.fetch = async () => {
+      heartbeatCount++;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          status: 'ok',
+          force_update: {
+            required_version: heartbeatCount === 1 ? '>=1.88.3' : '>=1.89.1',
+            reason: 'test',
+          },
+        }),
+        text: async () => '',
+      };
+    };
+
+    await sendHeartbeat();
+    await new Promise(resolve => setImmediate(resolve));
+    await sendHeartbeat();
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(executeForceUpdateCalls.length, 2,
+      'a no-op stale floor must not delay a newer force_update directive');
+    assert.equal(executeForceUpdateCalls[0].required_version, '>=1.88.3');
+    assert.equal(executeForceUpdateCalls[1].required_version, '>=1.89.1');
   });
 });

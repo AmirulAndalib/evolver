@@ -1313,7 +1313,8 @@ describe('force_update last_update reporting', () => {
   });
 
   // (nn) Bugbot PR#188 #2: _extractTargetVersion must reject trailing
-  // whitespace, mirroring forceUpdate.js:99-100 (which has no .trim()).
+  // whitespace, mirroring forceUpdate.js's strip-then-validate behavior (which
+  // has no .trim()).
   // Pre-fix, the extra .trim() let "1.88.0 " yield a phantom failed-row.
   describe('(nn) _extractTargetVersion rejects trailing whitespace (mirrors forceUpdate.js)', () => {
     it('rejects trailing space "1.88.0 "', () => {
@@ -1488,12 +1489,16 @@ describe('force_update last_update reporting', () => {
     const PARITY_INPUTS = [
       // Equal verdicts -- both accept
       '1.88.0', '>=1.88.0', '^1.88.0', '~1.88.0', '=1.88.0', ' 1.88.0',
-      '\t>=1.88.0', '= 1.88.0',
+      '\t>=1.88.0', '= 1.88.0', 'v1.88.0', '>=v1.88.0',
       '1.0.0-rc.1', '1.0.0+build.5', '1.0.0-rc.1+build.5',
+      '1.0.0-alpha-beta', '1.0.0-0.3.7', '1.0.0-x.7.z.92',
+      '1.0.0+20130313144700', '1.0.0-beta+exp.sha.5114f85',
       // Equal verdicts -- both reject
       '1.88.0 ', '1.88.0\t', '1.88.0\n', '1.88.0\r',
       '>=1.88.0 ', '1.88 .0', '1.88.0-rc 1',
-      'v1.88.0', '<1.88.0', '<=1.88.0', '>=v1.88.0',
+      '<1.88.0', '<=1.88.0',
+      '01.0.0', '1.02.0', '1.0.03', '1.0.0-01',
+      '1.0.0-alpha..1', '1.0.0-alpha_', '1.0.0+build_meta', '1.0.0+',
       '*', 'latest', '', '   ', '>= ',
       // Asymmetric (length): both accept but a2a TO_VERSION_MAX (32) caps it.
       // Listed but NOT checked for strict parity -- a2a is stricter on length,
@@ -1692,19 +1697,19 @@ describe('force_update last_update reporting', () => {
     assert.ok(!fs.existsSync(_statePath()), 'no pending, no file, no problem');
   });
 
-  // (bb) Pin the strip/validate contract against src/forceUpdate.js:44-45.
+  // (bb) Pin the strip/validate contract against src/forceUpdate.js.
   // The bug these guard against: _extractTargetVersion used to strip
-  // operators (notably "v" and "<"/"<=") that forceUpdate.js does NOT strip.
+  // operators (notably "<"/"<=") that forceUpdate.js does NOT strip.
   // Result -- telemetry would report to_version="1.88.0" for a directive
-  // (e.g. "v1.88.0" or "<2.0.0") that the upgrader itself rejects, producing
+  // (e.g. "<2.0.0") that the upgrader itself rejects, producing
   // ghost `failed` rows in EvolverUpgradeAttempt for upgrades that were
   // never even attempted. The cases below trace each input against
   // forceUpdate.js's `String(...).replace(/^[>=^~\s]+/, '')` strip class
-  // (matches >, =, ^, ~, whitespace -- NOT v, <, <=) followed by the same
-  // concrete-semver test.
-  describe('(bb) _extractTargetVersion mirrors forceUpdate.js:44-45', () => {
-    it('rejects "v1.88.0" (leading v is not in forceUpdate.js strip class)', () => {
-      assert.equal(_extractTargetVersionForTesting({ required_version: 'v1.88.0' }), '');
+  // (matches >, =, ^, ~, whitespace -- NOT < or <=), optional leading-v
+  // normalization, and the same concrete-semver test.
+  describe('(bb) _extractTargetVersion mirrors forceUpdate.js', () => {
+    it('accepts "v1.88.0" -> "1.88.0"', () => {
+      assert.equal(_extractTargetVersionForTesting({ required_version: 'v1.88.0' }), '1.88.0');
     });
     it('rejects "<1.88.0" (< is not in forceUpdate.js strip class)', () => {
       assert.equal(_extractTargetVersionForTesting({ required_version: '<1.88.0' }), '');
@@ -1712,8 +1717,8 @@ describe('force_update last_update reporting', () => {
     it('rejects "<=1.88.0" (<= is not in forceUpdate.js strip class)', () => {
       assert.equal(_extractTargetVersionForTesting({ required_version: '<=1.88.0' }), '');
     });
-    it('rejects ">=v1.88.0" (>= strips, leading v stays, semver fails)', () => {
-      assert.equal(_extractTargetVersionForTesting({ required_version: '>=v1.88.0' }), '');
+    it('accepts ">=v1.88.0" -> "1.88.0"', () => {
+      assert.equal(_extractTargetVersionForTesting({ required_version: '>=v1.88.0' }), '1.88.0');
     });
     it('accepts ">=1.88.0" -> "1.88.0"', () => {
       assert.equal(_extractTargetVersionForTesting({ required_version: '>=1.88.0' }), '1.88.0');
@@ -1732,6 +1737,13 @@ describe('force_update last_update reporting', () => {
     });
     it('accepts a bare "1.88.0" -> "1.88.0"', () => {
       assert.equal(_extractTargetVersionForTesting({ required_version: '1.88.0' }), '1.88.0');
+    });
+    it('rejects malformed semver identifiers', () => {
+      assert.equal(_extractTargetVersionForTesting({ required_version: '01.88.0' }), '');
+      assert.equal(_extractTargetVersionForTesting({ required_version: '1.88.03' }), '');
+      assert.equal(_extractTargetVersionForTesting({ required_version: '1.88.0-01' }), '');
+      assert.equal(_extractTargetVersionForTesting({ required_version: '1.88.0-alpha_' }), '');
+      assert.equal(_extractTargetVersionForTesting({ required_version: '1.88.0+build_meta' }), '');
     });
     it('rejects garbage / non-string / missing', () => {
       assert.equal(_extractTargetVersionForTesting({ required_version: '*' }), '');

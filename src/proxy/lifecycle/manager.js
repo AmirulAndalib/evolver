@@ -296,6 +296,7 @@ function _maybeTriggerForceUpdateFromHeartbeat(forceUpdate, logger) {
       _proxyForceUpdateInFlight = false;
     }
     if (busy) {
+      _proxyForceUpdateLastAttemptAt = 0;
       try {
         logger.log('[ForceUpdate] proxy heartbeat-trigger observed BUSY (concurrent invocation). Skipping telemetry; in-flight caller owns the outcome.');
       } catch (_) { /* logger broken; non-fatal */ }
@@ -321,6 +322,7 @@ function _maybeTriggerForceUpdateFromHeartbeat(forceUpdate, logger) {
       try { logger.log('[ForceUpdate] Update complete (proxy heartbeat-trigger). Exiting for restart...'); } catch (_) {}
       try { process.exit(78); } catch (_) {}
     } else if (noop) {
+      _proxyForceUpdateLastAttemptAt = 0;
       try {
         logger.log('[ForceUpdate] No-op (proxy heartbeat-trigger): already at required version. Skipping restart.');
       } catch (_) {}

@@ -6,8 +6,18 @@ const { getEvolverInstallRoot } = require('./gep/paths');
 
 const MAX_EXEC_BUFFER = 10 * 1024 * 1024;
 
+const SEMVER_NUMERIC_IDENTIFIER = '0|[1-9]\\d*';
+const SEMVER_PRERELEASE_IDENTIFIER = '(?:0|[1-9]\\d*|\\d*[A-Za-z-][0-9A-Za-z-]*)';
+const SEMVER_BUILD_IDENTIFIER = '[0-9A-Za-z-]+';
+const CONCRETE_SEMVER_RE = new RegExp(
+  '^(' + SEMVER_NUMERIC_IDENTIFIER + ')\\.(' + SEMVER_NUMERIC_IDENTIFIER + ')\\.(' +
+    SEMVER_NUMERIC_IDENTIFIER + ')(?:-(' + SEMVER_PRERELEASE_IDENTIFIER +
+    '(?:\\.' + SEMVER_PRERELEASE_IDENTIFIER + ')*))?(?:\\+(' +
+    SEMVER_BUILD_IDENTIFIER + '(?:\\.' + SEMVER_BUILD_IDENTIFIER + ')*))?$'
+);
+
 // Sentinel returned by executeForceUpdate when the no-op short-circuit fires
-// (current installed version already matches required_version). Distinct from
+// (current installed version already satisfies required_version). Distinct from
 // `true` so callers can suppress phantom "success" telemetry and avoid the
 // gratuitous process.exit(78) restart that follows a real upgrade. Callers
 // MUST detect this with === identity comparison; do not use truthy/falsy
@@ -35,6 +45,71 @@ const FORCE_UPDATE_BUSY = Symbol('FORCE_UPDATE_BUSY');
 // processes upgrading the same install root simultaneously (out of scope --
 // distinct processes have distinct install layouts in practice).
 let _inFlight = false;
+
+function parseConcreteSemver(version) {
+  var match = CONCRETE_SEMVER_RE.exec(normalizeConcreteSemver(version));
+  if (!match) return null;
+  return {
+    major: match[1],
+    minor: match[2],
+    patch: match[3],
+    prerelease: match[4] ? match[4].split('.') : [],
+  };
+}
+
+function normalizeConcreteSemver(version) {
+  var normalized = String(version || '').replace(/^v(?=\d)/, '');
+  return CONCRETE_SEMVER_RE.test(normalized) ? normalized : '';
+}
+
+function normalizeRequiredVersion(raw) {
+  return normalizeConcreteSemver(String(raw || '').replace(/^[>=^~\s]+/, ''));
+}
+
+function isNumericPrereleaseIdentifier(value) {
+  return /^\d+$/.test(value);
+}
+
+function compareNumericIdentifierStrings(left, right) {
+  if (left.length !== right.length) return left.length - right.length;
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
+function comparePrereleaseIdentifiers(left, right) {
+  var leftNumeric = isNumericPrereleaseIdentifier(left);
+  var rightNumeric = isNumericPrereleaseIdentifier(right);
+  if (leftNumeric && rightNumeric) return compareNumericIdentifierStrings(left, right);
+  if (leftNumeric) return -1;
+  if (rightNumeric) return 1;
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
+function compareConcreteSemver(left, right) {
+  var a = parseConcreteSemver(left);
+  var b = parseConcreteSemver(right);
+  if (!a || !b) return null;
+  var majorCmp = compareNumericIdentifierStrings(a.major, b.major);
+  if (majorCmp !== 0) return majorCmp;
+  var minorCmp = compareNumericIdentifierStrings(a.minor, b.minor);
+  if (minorCmp !== 0) return minorCmp;
+  var patchCmp = compareNumericIdentifierStrings(a.patch, b.patch);
+  if (patchCmp !== 0) return patchCmp;
+  if (!a.prerelease.length && !b.prerelease.length) return 0;
+  if (!a.prerelease.length) return 1;
+  if (!b.prerelease.length) return -1;
+  var max = Math.max(a.prerelease.length, b.prerelease.length);
+  for (var i = 0; i < max; i++) {
+    if (a.prerelease[i] === undefined) return -1;
+    if (b.prerelease[i] === undefined) return 1;
+    var cmp = comparePrereleaseIdentifiers(a.prerelease[i], b.prerelease[i]);
+    if (cmp !== 0) return cmp;
+  }
+  return 0;
+}
 
 // Force Update: triggered by Hub when version is critically outdated.
 // Extracted from src/evolve.js so both the evolve main loop and heartbeat
@@ -96,9 +171,11 @@ function _executeForceUpdateInner(forceUpdate) {
     return false;
   }
 
-  const requiredVersion = String(forceUpdate.required_version || '').replace(/^[>=^~\s]+/, '');
-  if (!/^\d+\.\d+\.\d+(-[\w.]+)?(\+[\w.]+)?$/.test(requiredVersion)) {
-    console.warn('[ForceUpdate] Refusing — required_version "' + requiredVersion + '" is not a concrete semver (ranges not accepted).');
+  const requiredVersion = normalizeRequiredVersion(forceUpdate.required_version);
+  if (!requiredVersion) {
+    console.warn('[ForceUpdate] Refusing — required_version "' +
+      String(forceUpdate.required_version || '').replace(/^[>=^~\s]+/, '') +
+      '" is not a concrete semver (ranges not accepted).');
     return false;
   }
 
@@ -109,22 +186,31 @@ function _executeForceUpdateInner(forceUpdate) {
     } catch (_) { return '0.0.0'; }
   }
 
-  // Idempotency short-circuit: the hub keeps re-issuing the same force_update
-  // directive until the node reports success. After a successful upgrade +
-  // restart (process.exit(78)), the next heartbeat may still carry the same
-  // directive. Without this early return, a transient Channel 1 failure (npx
-  // unavailable, network blip, EBUSY) would cause executeForceUpdate to
-  // return false and overwrite the previous successful run's state file with
-  // a bogus "failed" — even though we are already at the target version.
+  // Idempotency / anti-downgrade short-circuit: the hub keeps re-issuing the
+  // same force_update directive until the node reports success. After a
+  // successful upgrade + restart (process.exit(78)), the next heartbeat may
+  // still carry the same directive. Without this early return, a transient
+  // Channel 1 failure (npx unavailable, network blip, EBUSY) would cause
+  // executeForceUpdate to return false and overwrite the previous successful
+  // run's state file with a bogus "failed" -- even though we are already at or
+  // above the target version.
   //
   // Compare the ACTUAL current running version (which reflects the new
-  // version post-restart) against the parsed requiredVersion. Only reached
-  // after the strip+validate above, so a garbage / unparseable
-  // required_version will NOT short-circuit — it falls into the validation
-  // failure branch above and returns false safely.
+  // version post-restart) against the parsed requiredVersion. Force-update is
+  // a minimum-version floor, not an exact-version pin: a node running 1.88.4
+  // must not be downgraded to satisfy a 1.88.3 floor. Only reached after the
+  // strip+validate above, so a garbage / unparseable required_version will NOT
+  // short-circuit -- it falls into the validation failure branch above and
+  // returns false safely.
   var currentVersion = getCurrentVersion();
-  if (currentVersion === requiredVersion) {
-    console.log('[ForceUpdate] already at required version, no-op (current=' +
+  var versionCmp = compareConcreteSemver(currentVersion, requiredVersion);
+  if (versionCmp === null) {
+    console.warn('[ForceUpdate] Refusing — current installed version "' +
+      currentVersion + '" is not a concrete semver.');
+    return false;
+  }
+  if (versionCmp >= 0) {
+    console.log('[ForceUpdate] already satisfies required version, no-op (current=' +
       currentVersion + ', required=' + requiredVersion + ')');
     // Return the dedicated sentinel rather than `true`. Callers use this to
     // (a) emit status="skipped" telemetry instead of a phantom "success"
@@ -219,7 +305,7 @@ function _executeForceUpdateInner(forceUpdate) {
 }
 
 // Test-only hook: re-implements the EXACT same operator-strip + semver
-// validation as the inline check at executeForceUpdate's L99-100. Exists
+// validation as the runtime force_update check. Exists
 // so test/forceUpdateLastUpdateReport.test.js can build a parity sweep
 // proving that _extractTargetVersion's (a2aProtocol.js) verdict matches
 // forceUpdate.js's verdict byte-for-byte on any input -- the comment at
@@ -229,8 +315,7 @@ function _executeForceUpdateInner(forceUpdate) {
 // parity test breaks.
 function _isAcceptedRequiredVersionForTesting(raw) {
   if (typeof raw !== 'string') return false;
-  var stripped = String(raw).replace(/^[>=^~\s]+/, '');
-  return /^\d+\.\d+\.\d+(-[\w.]+)?(\+[\w.]+)?$/.test(stripped);
+  return normalizeRequiredVersion(raw) !== '';
 }
 
 module.exports = {

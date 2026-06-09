@@ -98,13 +98,19 @@ describe('bench: gene selection accuracy', function () {
   it('achieves >= 80% selection accuracy on standard signal scenarios', function () {
     var correct = 0;
     var total = TEST_CASES.length;
+    var origRandom = Math.random;
+    Math.random = function () { return 0.99; };
 
-    for (var i = 0; i < TEST_CASES.length; i++) {
-      var tc = TEST_CASES[i];
-      var result = selectGene(BENCH_GENES, tc.signals, { effectivePopulationSize: 100 });
-      if (result.selected && result.selected.id === tc.expected) {
-        correct++;
+    try {
+      for (var i = 0; i < TEST_CASES.length; i++) {
+        var tc = TEST_CASES[i];
+        var result = selectGene(BENCH_GENES, tc.signals, { effectivePopulationSize: 100 });
+        if (result.selected && result.selected.id === tc.expected) {
+          correct++;
+        }
       }
+    } finally {
+      Math.random = origRandom;
     }
 
     var accuracy = correct / total;

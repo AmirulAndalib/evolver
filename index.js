@@ -2560,6 +2560,33 @@ async function main() {
       process.exit(1);
     }
 
+  } else if (command === 'login') {
+    const { deviceLogin, resolveHubUrl, tokenFile } = require('./src/gep/oauthLogin');
+    const hubUrl = resolveHubUrl();
+    try {
+      console.log('Logging in to ' + hubUrl + ' ...');
+      const tok = await deviceLogin({
+        hubUrl,
+        onCode: ({ userCode, verificationUri }) => {
+          console.log('\nTo authorize this device:');
+          console.log('  1. open  ' + verificationUri);
+          console.log('  2. enter code:  ' + userCode);
+          console.log('\nWaiting for approval (Ctrl-C to cancel)...');
+        },
+      });
+      console.log('\n✓ Logged in. Token stored at ' + tokenFile() + ' (expires ' + new Date(tok.expires_at).toISOString() + ').');
+      process.exit(0);
+    } catch (error) {
+      console.error('login failed: ' + (error && error.message || error));
+      process.exit(1);
+    }
+
+  } else if (command === 'logout') {
+    const { clearOAuthToken, tokenFile } = require('./src/gep/oauthLogin');
+    const removed = clearOAuthToken();
+    console.log(removed ? ('Logged out (removed ' + tokenFile() + ').') : 'No OAuth token to remove.');
+    process.exit(0);
+
   } else if (command === 'setup-hooks') {
     const hookAdapter = require('./src/adapters/hookAdapter');
     const { setupHooks, resolveConfigRoot, detectPlatform, loadAdapter } = hookAdapter;
@@ -2916,7 +2943,9 @@ async function main() {
     }
 
   } else {
-    console.log(`Usage: node index.js [run|/evolve|solidify|review|distill|fetch|sync|asset-log|webui|setup-hooks|recipe|buy|orders|verify|atp|atp-complete] [--loop]
+    console.log(`Usage: node index.js [run|/evolve|login|logout|solidify|review|distill|fetch|sync|asset-log|webui|setup-hooks|recipe|buy|orders|verify|atp|atp-complete] [--loop]
+  - login                      (authorize this device via the hub, gh-auth-login style; stores an OAuth token used instead of node_secret)
+  - logout                     (remove the stored OAuth token)
   - recipe flags:
     - build --title="..." --genes=<asset_id,...> [--description] [--price=N] [--publish]
                               (builds a DRAFT DNA blueprint; --publish is opt-in)

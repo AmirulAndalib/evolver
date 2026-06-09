@@ -55,6 +55,7 @@ process.env.EVOLVER_HOME = _tmpEvolverHome;
 const forceUpdatePath = require.resolve('../src/forceUpdate');
 let executeForceUpdateCalls = [];
 let executeForceUpdateReturn = false;
+let executeForceUpdateReturns = [];
 let executeForceUpdateThrow = null;
 // FORCE_UPDATE_NOOP / FORCE_UPDATE_BUSY must be stable identities that
 // the manager picks up via `mod.FORCE_UPDATE_NOOP === result` /
@@ -70,6 +71,7 @@ require.cache[forceUpdatePath] = {
     executeForceUpdate: function (fu) {
       executeForceUpdateCalls.push(fu);
       if (executeForceUpdateThrow) throw executeForceUpdateThrow;
+      if (executeForceUpdateReturns.length > 0) return executeForceUpdateReturns.shift();
       return executeForceUpdateReturn;
     },
     FORCE_UPDATE_NOOP: SPY_NOOP,
@@ -182,6 +184,7 @@ async function settleMicrotasks() {
 function resetAll() {
   executeForceUpdateCalls = [];
   executeForceUpdateReturn = false;
+  executeForceUpdateReturns = [];
   executeForceUpdateThrow = null;
   exitCalls = [];
   _resetProxyForceUpdateStateForTesting();
@@ -447,6 +450,45 @@ test('FORCE_UPDATE_NOOP sentinel results in status="skipped" and no exit', async
     assert.strictEqual(pending.status, 'skipped',
       'NOOP sentinel must report status="skipped"');
   } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('FORCE_UPDATE_NOOP does not consume cooldown for a later higher version', async () => {
+  resetAll();
+  executeForceUpdateReturns = [SPY_NOOP, false];
+  const prev = process.env.EVOLVER_FORCE_UPDATE_RETRY_COOLDOWN_MS;
+  process.env.EVOLVER_FORCE_UPDATE_RETRY_COOLDOWN_MS = '3600000';
+  const originalFetch = global.fetch;
+  try {
+    const mf = mockFetch((callNo) => responseFromJson({
+      status: 200,
+      json: {
+        status: 'ok',
+        force_update: {
+          required_version: callNo === 1 ? '>=1.88.3' : '>=1.89.1',
+          reason: 'atp',
+        },
+      },
+    }));
+    global.fetch = mf;
+
+    const mgr = new LifecycleManager({
+      hubUrl: 'https://example.test',
+      store: makeStore(),
+      logger: silentLogger(),
+    });
+    await mgr.heartbeat();
+    await settleMicrotasks();
+    await mgr.heartbeat();
+    await settleMicrotasks();
+
+    assert.strictEqual(executeForceUpdateCalls.length, 2,
+      'a proxy no-op stale floor must not delay a newer force_update directive');
+    assert.strictEqual(executeForceUpdateCalls[0].required_version, '>=1.88.3');
+    assert.strictEqual(executeForceUpdateCalls[1].required_version, '>=1.89.1');
+  } finally {
+    process.env.EVOLVER_FORCE_UPDATE_RETRY_COOLDOWN_MS = prev;
     global.fetch = originalFetch;
   }
 });

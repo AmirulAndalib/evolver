@@ -23,6 +23,7 @@ const os = require('os');
 const path = require('path');
 
 const { LifecycleManager } = require('../src/proxy/lifecycle/manager');
+const { _resetCachedNodeIdForTesting } = require('../src/gep/a2aProtocol')._testing;
 
 const _origInsecure = process.env.EVOMAP_HUB_ALLOW_INSECURE;
 process.env.EVOMAP_HUB_ALLOW_INSECURE = '1';
@@ -90,12 +91,14 @@ async function withFakeEvomapDir(dir, body) {
   const _origHome = process.env.EVOLVER_HOME;
   const _origFetch = global.fetch;
   process.env.EVOLVER_HOME = dir;
+  _resetCachedNodeIdForTesting();
   try {
     return await body();
   } finally {
     if (_origHome === undefined) delete process.env.EVOLVER_HOME;
     else process.env.EVOLVER_HOME = _origHome;
     global.fetch = _origFetch;
+    _resetCachedNodeIdForTesting();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
