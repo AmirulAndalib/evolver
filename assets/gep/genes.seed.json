@@ -240,6 +240,257 @@
         "tier": "cheap",
         "reasoning_level": "low"
       }
+    },
+    {
+      "type": "Gene",
+      "id": "gene_publish_feishu_doc",
+      "category": "innovate",
+      "signals_match": [
+        "publish_markdown_to_feishu",
+        "create_feishu_doc",
+        "export_report_to_feishu",
+        "把结果发到飞书文档",
+        "发布飞书文档",
+        "把报告导出到飞书",
+        "publish results to a feishu doc",
+        "export notes to lark document",
+        "飞书文档",
+        "发布到飞书",
+        "导出到飞书",
+        "发到飞书",
+        "lark文档",
+        "飞书文档|lark doc|feishu doc"
+      ],
+      "strategy": [
+        "Verify the toolchain: run `lark-cli doctor` and require ok:true with at least one ready identity",
+        "Always use the Docs v2 API (v1 is deprecated): pass `--api-version v2`",
+        "Write the body as Lark-flavored Markdown to a temp file and pass `--content @file.md --doc-format markdown` to avoid shell-escaping bugs",
+        "Create with the user identity so the doc is human-owned: `lark-cli docs +create --api-version v2 --as user --doc-format markdown --content @file.md`",
+        "To place it in a folder or wiki add `--parent-token <token>` (use `--parent-position my_library` for the personal space)",
+        "Parse data.document.url from the JSON response and return it to the user; use `docs +update --api-version v2` with the document_id to amend instead of recreating"
+      ],
+      "validation": [
+        "node --version"
+      ],
+      "constraints": {
+        "max_files": 2,
+        "forbidden_paths": [
+          ".git",
+          "node_modules",
+          "~/.lark-cli/config.json"
+        ]
+      },
+      "preconditions": [
+        "lark-cli installed and on PATH (npm i -g @larksuite/cli)",
+        "lark-cli auth status reports a ready user or bot identity"
+      ],
+      "summary": "Publish Markdown content as a Feishu/Lark document via the official lark-cli (Docs v2). Use --as user for human-owned docs and @file content for long bodies; return the resulting document URL.",
+      "schema_version": "1.6.0",
+      "epigenetic_marks": [],
+      "learning_history": [],
+      "anti_patterns": [],
+      "routing_hint": null,
+      "tool_policy": null,
+      "avoid": [
+        "using the deprecated Docs v1 API or the v1 --markdown flag",
+        "passing long markdown inline (shell-escaping corrupts it) instead of --content @file",
+        "overwriting ~/.lark-cli/config.json (holds the app secret and tokens)"
+      ],
+      "asset_id": "sha256:9ed275fd6394567d0eb6c0fda45193bbeaba7bd84941ea4e75eb7fc859fb0dcf"
+    },
+    {
+      "type": "Gene",
+      "id": "gene_conventional_git_commit",
+      "category": "optimize",
+      "signals_match": [
+        "git_commit",
+        "create_commit",
+        "commit_changes",
+        "conventional_commit",
+        "提交代码",
+        "生成提交信息",
+        "write a commit message",
+        "stage and commit"
+      ],
+      "strategy": [
+        "Inspect the change: `git diff --staged` if anything is staged, else `git diff`, plus `git status --porcelain`",
+        "Pick a Conventional Commits type (feat/fix/docs/style/refactor/perf/test/build/ci/chore/revert) and optional scope from what actually changed",
+        "Stage logically-grouped files explicitly (git add <paths>); NEVER stage or commit secrets (.env, credentials, private keys)",
+        "Write a present-tense imperative description under 72 chars; add a body/footer for breaking changes (type! or BREAKING CHANGE:) and issue refs (Closes #N)",
+        "Commit one logical change with `git commit -m` (heredoc for multi-line)",
+        "Safety: never touch git config, never --force/hard-reset/--no-verify without explicit request, never force-push main; if a hook fails, fix and make a NEW commit (do not amend)"
+      ],
+      "validation": [
+        "node --version"
+      ],
+      "constraints": {
+        "max_files": 50,
+        "forbidden_paths": [
+          ".git",
+          "node_modules"
+        ]
+      },
+      "preconditions": [
+        "a git repository with staged or unstaged changes"
+      ],
+      "summary": "Create a Conventional Commits-style git commit: analyze the diff to pick type/scope, stage logical groups (never secrets), and write an imperative <72-char message.",
+      "schema_version": "1.6.0",
+      "epigenetic_marks": [],
+      "learning_history": [],
+      "anti_patterns": [],
+      "routing_hint": null,
+      "tool_policy": null,
+      "avoid": [
+        "committing secrets or unrelated changes in one commit",
+        "amending or force-pushing to bypass a failing hook",
+        "past-tense or vague messages like \"updated stuff\""
+      ],
+      "asset_id": "sha256:505c207b9984c397255daed61c5f24fb3bfcadedb803d2a4eaa429457f08cd2f"
+    },
+    {
+      "type": "Gene",
+      "id": "gene_poll_bugbot_review",
+      "category": "optimize",
+      "signals_match": [
+        "poll_bugbot",
+        "bugbot_review",
+        "wait_for_ci_review",
+        "pr_review_gate",
+        "等bugbot",
+        "等待评审",
+        "check bugbot",
+        "review the pr",
+        "pr opened"
+      ],
+      "strategy": [
+        "Poll the \"Cursor Bugbot\" check via `gh pr view --json statusCheckRollup` every ~60s until status=COMPLETED (cap ~10min); filter by name, not index",
+        "On SUCCESS: safe to merge ONLY if no other required check is red AND zero open inline comments from the cursor[bot] login (note the [bot] suffix)",
+        "On NEUTRAL: do NOT treat as pass — fetch inline comments `gh api repos/:o/:r/pulls/:n/comments` filtered to user.login==\"cursor[bot]\", surface path/line/severity, hand back to the human",
+        "On FAILURE/ACTION_REQUIRED: surface findings, do not merge",
+        "Auto-merge (squash + delete-branch) only when explicitly authorized AND conclusion is SUCCESS; merge conflicts/CI-red/required-review surface verbatim, never auto-fixed here"
+      ],
+      "validation": [
+        "node --version"
+      ],
+      "constraints": {
+        "max_files": 1,
+        "forbidden_paths": [
+          ".git",
+          "node_modules"
+        ]
+      },
+      "preconditions": [
+        "an open GitHub PR in a repo where Cursor Bugbot runs"
+      ],
+      "summary": "Wait for Cursor Bugbot on a GitHub PR, then gate on the conclusion: SUCCESS may merge, NEUTRAL/FAILURE always pauses to surface inline findings to the human.",
+      "schema_version": "1.6.0",
+      "epigenetic_marks": [],
+      "learning_history": [],
+      "anti_patterns": [],
+      "routing_hint": null,
+      "tool_policy": null,
+      "avoid": [
+        "treating NEUTRAL as pass (it has shipped real bugs before)",
+        "filtering comments on \"cursor\" instead of \"cursor[bot]\" (silently returns nothing)",
+        "auto-merging without explicit authorization or with CI red"
+      ],
+      "asset_id": "sha256:0f50f4cfecb0e6f3a9bd3c9c0a426e56f4f1c0230b4836a9471b38e499410ea9"
+    },
+    {
+      "type": "Gene",
+      "id": "gene_gateway_timeout_recovery",
+      "category": "repair",
+      "signals_match": [
+        "gateway_timeout",
+        "upstream_timeout",
+        "http_524",
+        "request_timed_out",
+        "超时了",
+        "网关超时",
+        "遇到超时",
+        "retry on timeout",
+        "operation timed out"
+      ],
+      "strategy": [
+        "Treat it as transient or size-driven, not a logic failure; do not report it as a hard failure before recovering",
+        "Retry the SAME operation verbatim exactly ONCE (a large fraction clear on immediate retry); do not loop",
+        "If it times out again, STOP retrying the monolith: split the work along a natural seam (per-file/dir/endpoint/record/section/time-window) into small independent units",
+        "Dispatch the units as parallel subagents in a single batch so each finishes under the gateway deadline; merge their results",
+        "If one unit itself times out, apply this same procedure recursively to that slice"
+      ],
+      "validation": [
+        "node --version"
+      ],
+      "constraints": {
+        "max_files": 1,
+        "forbidden_paths": [
+          ".git",
+          "node_modules"
+        ]
+      },
+      "preconditions": [
+        "a tool call / fetch / subagent / long command returned a gateway-class timeout (524/522/502/504)"
+      ],
+      "summary": "Recover from a gateway/upstream timeout: retry the same call once, and if it still times out, decompose the work into parallel subagents and merge — never loop the monolithic call.",
+      "schema_version": "1.6.0",
+      "epigenetic_marks": [],
+      "learning_history": [],
+      "anti_patterns": [],
+      "routing_hint": null,
+      "tool_policy": null,
+      "avoid": [
+        "retrying the same large call more than once",
+        "serial retries instead of parallel decomposition",
+        "surfacing the timeout as a hard failure before recovering"
+      ],
+      "asset_id": "sha256:63c4251dcd8308030194f797051c08672691b52553e00b0eb33772c215712acc"
+    },
+    {
+      "type": "Gene",
+      "id": "gene_github_webhook_listener",
+      "category": "innovate",
+      "signals_match": [
+        "github_webhook_listener",
+        "bugbot_webhook",
+        "passive_pr_notifications",
+        "设置webhook",
+        "部署webhook监听",
+        "notify when bugbot finishes",
+        "webhook tunnel"
+      ],
+      "strategy": [
+        "Run the idempotent deploy: a loopback Python listener (127.0.0.1:8644) validating GitHub X-Hub-Signature-256 HMAC via hmac.compare_digest, writing vetted payloads to ~/.claude/inbox/",
+        "Expose it via a cloudflared quick tunnel (outbound-only, no inbound port); a path-watcher re-PATCHes the GitHub webhook config whenever the tunnel URL changes",
+        "Keep listener + tunnel alive with systemd --user units hardened (ProtectSystem=strict, NoNewPrivileges, MemoryDenyWriteExecute); a SessionStart hook drains the inbox and re-validates PR state via gh api before surfacing",
+        "Security invariants: HMAC on every request, X-GitHub-Delivery dedup against replay, write-only sink (never exec/template/deserialize payload), file modes secret 0600 / inbox 0700",
+        "Add repos with deploy.sh --repos; rotate the secret every 90 days (rotate-secret.sh) and immediately on any leak; never trust the inbox payload without re-fetching"
+      ],
+      "validation": [
+        "node --version"
+      ],
+      "constraints": {
+        "max_files": 20,
+        "forbidden_paths": [
+          ".git",
+          "node_modules"
+        ]
+      },
+      "preconditions": [
+        "a developer machine with systemd --user and cloudflared available"
+      ],
+      "summary": "Deploy a per-developer GitHub webhook listener (HMAC-validated, cloudflared tunnel, systemd-kept) that drops PR/Bugbot events into ~/.claude/inbox for the next session to surface.",
+      "schema_version": "1.6.0",
+      "epigenetic_marks": [],
+      "learning_history": [],
+      "anti_patterns": [],
+      "routing_hint": null,
+      "tool_policy": null,
+      "avoid": [
+        "opening an inbound port instead of an outbound cloudflared tunnel",
+        "trusting the webhook payload without HMAC validation and PR re-fetch",
+        "execing or deserializing anything from the payload"
+      ],
+      "asset_id": "sha256:ac2a2f185390aef37996651ef21355f4beb437049e52a6ca3898619a8d648084"
     }
   ]
 }

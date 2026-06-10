@@ -89,6 +89,13 @@ function canonicalizeForBedrock(modelId) {
   return KNOWN_BEDROCK_ALIASES[key] || modelId;
 }
 
+function supportsAdaptiveThinking(modelId) {
+  const parsed = parseClaudeId(modelId);
+  if (!parsed) return false;
+  if (parsed.major > 4) return true;
+  return parsed.major === 4 && parsed.minor >= 7;
+}
+
 function resolveTierModels() {
   return {
     cheap: process.env.EVOMAP_MODEL_CHEAP || DEFAULT_TIER_MODELS.cheap,
@@ -465,5 +472,6 @@ module.exports = {
   parseClaudeId,
   isIntraFamilyDowngrade,
   canonicalizeForBedrock,
+  supportsAdaptiveThinking,
   KNOWN_BEDROCK_ALIASES,
 };

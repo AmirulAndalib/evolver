@@ -38,6 +38,102 @@ const FORCE_UPDATE_NOOP = Symbol('FORCE_UPDATE_NOOP');
 // fire its own reportForceUpdateOutcome. See test/forceUpdateConcurrencyGuard.test.js.
 const FORCE_UPDATE_BUSY = Symbol('FORCE_UPDATE_BUSY');
 
+// Structured failure taxonomy. Historically every failing branch of
+// _executeForceUpdateInner just `return false`, so the only thing that ever
+// reached the hub (via reportForceUpdateOutcome) was the literal string
+// "executeForceUpdate returned false" — degit-missing, tag-404, version
+// mismatch and copy-EPERM were all indistinguishable in EvolverUpgradeAttempt.
+// Each branch now returns _fail(code, detail); the reporter encodes it as
+// `error = code + ': ' + detail`, so operators can GROUP BY the code prefix
+// without any hub schema / DB migration. Codes are a small stable set — keep
+// new ones coarse and additive so historical `error LIKE 'code%'` queries
+// don't churn.
+const FORCE_UPDATE_FAIL_CODES = Object.freeze({
+  INSTALL_GUARD_NAME_MISMATCH: 'install_guard_name_mismatch',
+  INSTALL_GUARD_UNREADABLE: 'install_guard_unreadable',
+  BAD_REQUIRED_VERSION: 'bad_required_version',
+  CURRENT_VERSION_UNPARSABLE: 'current_version_unparsable',
+  NPX_NOT_FOUND: 'npx_not_found',
+  DEGIT_TIMEOUT: 'degit_timeout',
+  DEGIT_FAILED: 'degit_failed',
+  DOWNLOAD_INCOMPLETE: 'download_incomplete',
+  DOWNLOADED_VERSION_MISMATCH: 'downloaded_version_mismatch',
+  COPY_FAILED: 'copy_failed',
+  ALL_CHANNELS_EXHAUSTED: 'all_channels_exhausted',
+});
+
+// Build the structured failure result that replaces a bare `return false`.
+// Shape: { ok:false, code, detail }. Distinct from `true`, FORCE_UPDATE_NOOP
+// and FORCE_UPDATE_BUSY, so the three call sites' `result === true` /
+// `result === SENTINEL` checks keep classifying it as "failed" unchanged —
+// this is backward compatible. Frozen so a downstream consumer cannot mutate
+// the code/detail before it is reported. detail is best-effort context (an
+// errno, a version delta, an entry name); it is redacted + truncated to
+// ERROR_MAX by the reporter before it leaves the process.
+function _fail(code, detail) {
+  return Object.freeze({
+    ok: false,
+    code: String(code),
+    detail: detail == null ? '' : String(detail),
+  });
+}
+
+// Compact "CODE: message" rendering of a thrown error for the detail field.
+function _errStr(e) {
+  if (!e) return 'unknown';
+  var code = e.code ? String(e.code) + ': ' : '';
+  return code + (e.message != null ? String(e.message) : String(e));
+}
+
+// Map a Channel 1 (GitHub Release / degit) throw to a structured failure.
+// `phase` records how far the try block got before throwing, so a readFileSync
+// ENOENT (truncated download) is not misread as an npx ENOENT (npx missing):
+//   'degit' -> the npx/degit spawn itself
+//   'parse' -> degit exited 0 but the downloaded package.json is missing/invalid
+//   'copy'  -> the staged tree downloaded fine but cpSync into INSTALL_ROOT failed
+function _classifyChannel1Error(e, phase) {
+  if (phase === 'copy') {
+    var entry = e && e._evolverEntry ? String(e._evolverEntry) + ': ' : '';
+    return _fail(FORCE_UPDATE_FAIL_CODES.COPY_FAILED, entry + _errStr(e));
+  }
+  if (phase === 'parse') {
+    return _fail(FORCE_UPDATE_FAIL_CODES.DOWNLOAD_INCOMPLETE,
+      'missing/invalid package.json in downloaded tree: ' + _errStr(e));
+  }
+  // phase === 'degit' (the spawn). ENOENT here is the npx binary itself, not a
+  // file inside the download — that distinction is exactly why `phase` exists.
+  if (e && e.code === 'ENOENT') {
+    return _fail(FORCE_UPDATE_FAIL_CODES.NPX_NOT_FOUND, _errStr(e));
+  }
+  // execFileSync timeout kills the child with SIGTERM (and sets .killed); some
+  // platforms surface ETIMEDOUT instead. Either way it is a 60s timeout.
+  if (e && (e.killed || e.signal === 'SIGTERM' || e.code === 'ETIMEDOUT')) {
+    return _fail(FORCE_UPDATE_FAIL_CODES.DEGIT_TIMEOUT,
+      'degit timed out after 60s' + (e.signal ? ' (signal=' + e.signal + ')' : ''));
+  }
+  // Generic degit/network/tag-not-found failure. degit prints the real reason
+  // ("could not find commit hash for v…", "could not resolve host") to stderr,
+  // so keep a tail of it. Redact + strip control chars HERE, before the tail
+  // slice: the downstream reporter redact (a2aProtocol.reportForceUpdateOutcome)
+  // runs after this, so slicing first could chop a token's prefix anchor and
+  // let the bare value slip past the prefix-anchored redact patterns. Stripping
+  // ANSI/NUL/newlines also keeps the persisted error free of terminal-injection
+  // sequences and log-line noise.
+  var detail = _errStr(e);
+  var stderr = '';
+  if (e && e.stderr != null) {
+    try {
+      var redactString = require('./gep/sanitize').redactString;
+      stderr = redactString(String(e.stderr)).replace(/[\x00-\x1f\x7f]/g, ' ').trim();
+    } catch (_) {
+      // sanitize unavailable — still strip control chars so logs stay clean.
+      stderr = String(e.stderr).replace(/[\x00-\x1f\x7f]/g, ' ').trim();
+    }
+  }
+  if (stderr) detail += ' | stderr=' + stderr.slice(-300);
+  return _fail(FORCE_UPDATE_FAIL_CODES.DEGIT_FAILED, detail);
+}
+
 // Module-level mutex: shared by every caller that requires('../forceUpdate'),
 // so the heartbeat-thread trigger in a2aProtocol.js and the evolve-tick path
 // in enrich/pipeline cannot run executeForceUpdate concurrently. This is a
@@ -163,12 +259,14 @@ function _executeForceUpdateInner(forceUpdate) {
       console.warn('[ForceUpdate] Refusing — ' + INSTALL_ROOT +
         '/package.json has name="' + (pkg && pkg.name) +
         '", expected "@evomap/evolver". Aborting to avoid data loss.');
-      return false;
+      return _fail(FORCE_UPDATE_FAIL_CODES.INSTALL_GUARD_NAME_MISMATCH,
+        'install root package.json name="' + (pkg && pkg.name) + '", expected "@evomap/evolver"');
     }
   } catch (e) {
     console.warn('[ForceUpdate] Refusing — cannot read ' + INSTALL_ROOT +
       '/package.json: ' + (e && e.message || e));
-    return false;
+    return _fail(FORCE_UPDATE_FAIL_CODES.INSTALL_GUARD_UNREADABLE,
+      'cannot read install root package.json: ' + _errStr(e));
   }
 
   const requiredVersion = normalizeRequiredVersion(forceUpdate.required_version);
@@ -176,7 +274,8 @@ function _executeForceUpdateInner(forceUpdate) {
     console.warn('[ForceUpdate] Refusing — required_version "' +
       String(forceUpdate.required_version || '').replace(/^[>=^~\s]+/, '') +
       '" is not a concrete semver (ranges not accepted).');
-    return false;
+    return _fail(FORCE_UPDATE_FAIL_CODES.BAD_REQUIRED_VERSION,
+      'required_version=' + JSON.stringify(forceUpdate && forceUpdate.required_version) + ' is not a concrete semver');
   }
 
   function getCurrentVersion() {
@@ -207,7 +306,8 @@ function _executeForceUpdateInner(forceUpdate) {
   if (versionCmp === null) {
     console.warn('[ForceUpdate] Refusing — current installed version "' +
       currentVersion + '" is not a concrete semver.');
-    return false;
+    return _fail(FORCE_UPDATE_FAIL_CODES.CURRENT_VERSION_UNPARSABLE,
+      'current installed version "' + currentVersion + '" is not a concrete semver');
   }
   if (versionCmp >= 0) {
     console.log('[ForceUpdate] already satisfies required version, no-op (current=' +
@@ -230,6 +330,14 @@ function _executeForceUpdateInner(forceUpdate) {
   const TMP_TARGET = fs.mkdtempSync(path.join(os.tmpdir(), '.evolver-update-tmp-'));
 
   // Channel 1: GitHub Release (via degit pinned to exact version tag)
+  //
+  // channel1Failure captures the structured reason this channel failed, so the
+  // terminal `return` can surface it instead of a bare `false`. `phase` tracks
+  // how far we got before any throw, so _classifyChannel1Error can tell a
+  // degit-spawn failure (phase 'degit') from a truncated download (phase
+  // 'parse') from a copy-into-INSTALL_ROOT failure (phase 'copy').
+  var channel1Failure = null;
+  var phase = 'degit';
   try {
     console.log('[ForceUpdate] Channel 1: GitHub Release download (v' + requiredVersion + ')...');
     var npxBin = process.platform === 'win32' ? 'npx.cmd' : 'npx';
@@ -240,19 +348,34 @@ function _executeForceUpdateInner(forceUpdate) {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 60000, windowsHide: true, maxBuffer: MAX_EXEC_BUFFER,
     });
+    phase = 'parse';
     var tmpPkg = JSON.parse(fs.readFileSync(path.join(TMP_TARGET, 'package.json'), 'utf8'));
     // Require exact version match — a ">=" check would allow a compromised hub to
     // request version "0.0.1" and install any version including unreleased HEAD code.
     if (tmpPkg.version && tmpPkg.version === requiredVersion) {
+      phase = 'copy';
       var entries = fs.readdirSync(INSTALL_ROOT, { withFileTypes: true });
       for (var ei = 0; ei < entries.length; ei++) {
         var eName = entries[ei].name;
+        // package.json is the install's commit marker: keep the OLD one in
+        // place through the entire delete+copy below and swap in the new one
+        // atomically at the very end (see "commit marker" block). If it were
+        // deleted here and any later cpSync threw (ENOSPC, a Windows lock that
+        // outlasts the retries, a kill), the install root would be left with
+        // no package.json — and the install-guard at the top of this function
+        // refuses on an unreadable package.json, wedging the node in
+        // install_guard_unreadable on every subsequent attempt with no path
+        // that ever re-copies it. Deferring it keeps the install self-healing.
         if (eName === 'node_modules' || eName === 'memory' || eName === '.git' || eName === 'MEMORY.md'
-            || eName === '.env' || eName === '.env.local' || eName === 'USER.md' || eName === '.evolver') continue;
+            || eName === '.env' || eName === '.env.local' || eName === 'USER.md' || eName === '.evolver'
+            || eName === 'package.json') continue;
         try { fs.rmSync(path.join(INSTALL_ROOT, eName), { recursive: true, force: true }); } catch (_) {}
       }
       var newEntries = fs.readdirSync(TMP_TARGET, { withFileTypes: true });
       for (var ni = 0; ni < newEntries.length; ni++) {
+        // Deferred: package.json is the commit marker, written last + atomically
+        // after every other entry has copied successfully (see below).
+        if (newEntries[ni].name === 'package.json') continue;
         var src = path.join(TMP_TARGET, newEntries[ni].name);
         var dst = path.join(INSTALL_ROOT, newEntries[ni].name);
         // On Windows, files held open by antivirus or the OS itself raise EPERM/EBUSY.
@@ -275,16 +398,70 @@ function _executeForceUpdateInner(forceUpdate) {
         }
         if (copyErr) {
           console.warn('[ForceUpdate] cpSync failed for ' + newEntries[ni].name + ': ' + (copyErr.message || copyErr));
+          // Tag the failing entry so _classifyChannel1Error can name it in the
+          // copy_failed detail. phase is already 'copy' here.
+          try { copyErr._evolverEntry = newEntries[ni].name; } catch (_) {}
           throw copyErr;
         }
+      }
+      // Commit marker: every other entry copied successfully, so swap in the
+      // new package.json LAST and atomically. The old package.json was kept in
+      // place above; only this rename makes the new version visible. Net effect:
+      //   - any throw before this point leaves the OLD package.json intact, so
+      //     the install-guard still reads a valid package.json next tick and the
+      //     force-update simply retries (no install_guard_unreadable wedge);
+      //   - the new version becomes "current" only once the tree is fully in
+      //     place, so a partial install never reports as already-satisfied.
+      // tmp + rename in INSTALL_ROOT (same filesystem) is an atomic replace on
+      // POSIX; Windows renameSync throws EPERM over an existing dest, so unlink
+      // first there. Mirrors src/proxy/mailbox/store.js _persistState.
+      var pkgSrc = path.join(TMP_TARGET, 'package.json');
+      var pkgDst = path.join(INSTALL_ROOT, 'package.json');
+      var pkgTmp = pkgDst + '.' + process.pid + '.evolver-tmp';
+      var pkgErr = null;
+      for (var pa = 0; pa < 3; pa++) {
+        try {
+          fs.cpSync(pkgSrc, pkgTmp);
+          if (process.platform === 'win32') {
+            try { fs.unlinkSync(pkgDst); } catch (ue) { if (ue && ue.code !== 'ENOENT') throw ue; }
+          }
+          fs.renameSync(pkgTmp, pkgDst);
+          pkgErr = null;
+          break;
+        } catch (pErr) {
+          pkgErr = pErr;
+          try { fs.rmSync(pkgTmp, { force: true }); } catch (_) {}
+          var pcode = pErr && pErr.code;
+          if (pcode !== 'EPERM' && pcode !== 'EBUSY' && pcode !== 'EACCES') break;
+          var puntil = Date.now() + 200;
+          while (Date.now() < puntil) { /* spin */ }
+        }
+      }
+      if (pkgErr) {
+        console.warn('[ForceUpdate] package.json commit (atomic replace) failed: ' + (pkgErr.message || pkgErr));
+        throw pkgErr;
       }
       try { fs.rmSync(TMP_TARGET, { recursive: true, force: true }); } catch (_) {}
       console.log('[ForceUpdate] GitHub Release update successful: ' + tmpPkg.version);
       return true;
     }
+    // degit succeeded and produced a parseable package.json, but it did not
+    // satisfy the exact-version check above. Two distinct causes, two codes:
+    if (!tmpPkg.version) {
+      // degit produced a parseable package.json with no version field — a
+      // malformed/incomplete download, not a stale/tampered tag mismatch.
+      channel1Failure = _fail(FORCE_UPDATE_FAIL_CODES.DOWNLOAD_INCOMPLETE,
+        'downloaded package.json has no version field');
+    } else {
+      // version present but not the exact tag we asked for (stale tag, mirror
+      // lag, or a tampered/redirected tag). Refuse and record the delta.
+      channel1Failure = _fail(FORCE_UPDATE_FAIL_CODES.DOWNLOADED_VERSION_MISMATCH,
+        'downloaded version=' + JSON.stringify(tmpPkg.version) + ', expected ' + requiredVersion);
+    }
     try { fs.rmSync(TMP_TARGET, { recursive: true, force: true }); } catch (_) {}
   } catch (e) {
-    console.warn('[ForceUpdate] GitHub Release failed:', e && e.message || e);
+    channel1Failure = _classifyChannel1Error(e, phase);
+    console.warn('[ForceUpdate] GitHub Release failed (' + channel1Failure.code + '):', e && e.message || e);
     try { fs.rmSync(TMP_TARGET, { recursive: true, force: true }); } catch (_) {}
     // Fall through to Channel 2 (manual download URL hint) instead of
     // returning. A Channel 1 error (degit missing, network down, tag not
@@ -301,7 +478,12 @@ function _executeForceUpdateInner(forceUpdate) {
   } catch (_) {}
 
   console.warn('[ForceUpdate] All automatic channels exhausted. Current version: ' + getCurrentVersion());
-  return false;
+  // Surface the concrete Channel 1 failure when we have one (the common case:
+  // degit/network/copy/version-mismatch). channel1Failure is null only when
+  // Channel 1 was never entered, which cannot happen here — but fall back to a
+  // terminal code so the reporter never lands on the legacy "returned false".
+  return channel1Failure || _fail(FORCE_UPDATE_FAIL_CODES.ALL_CHANNELS_EXHAUSTED,
+    'no automatic channel succeeded; current=' + getCurrentVersion() + ' target=' + requiredVersion);
 }
 
 // Test-only hook: re-implements the EXACT same operator-strip + semver
@@ -318,10 +500,21 @@ function _isAcceptedRequiredVersionForTesting(raw) {
   return normalizeRequiredVersion(raw) !== '';
 }
 
+// Type guard: is `result` a structured failure (vs true / NOOP / BUSY)?
+// Call sites use this to decide whether to forward result as opts.failure to
+// reportForceUpdateOutcome. Kept tiny and dependency-free so all three
+// duplicated triggers (a2aProtocol heartbeat, proxy manager, enrich tick) can
+// share one definition.
+function isForceUpdateFailure(result) {
+  return !!result && typeof result === 'object' && result.ok === false && typeof result.code === 'string';
+}
+
 module.exports = {
   executeForceUpdate,
   FORCE_UPDATE_NOOP,
   FORCE_UPDATE_BUSY,
+  FORCE_UPDATE_FAIL_CODES,
+  isForceUpdateFailure,
   // Test-only hook: reset the in-flight mutex so unit tests do not leak state
   // across cases. Production callers must NOT touch this -- the mutex is the
   // load-bearing invariant that prevents concurrent state-file writes.

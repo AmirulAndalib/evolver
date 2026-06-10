@@ -137,7 +137,8 @@ describe('executeForceUpdate: keep-list preserves user config files', () => {
     // failure path that this test is asserting on.
     const result = executeForceUpdate({ required_version: '>=2.0.0' });
 
-    assert.equal(result, false, 'update should fail');
+    assert.equal(result.ok, false, 'update should fail');
+    assert.equal(result.code, 'degit_failed', 'degit network throw classified as degit_failed');
     // Deletion loop never runs when degit fails — .env must still be present
     assert.ok(fs.existsSync(path.join(installRoot, '.env')),
       '.env must survive a failed update');

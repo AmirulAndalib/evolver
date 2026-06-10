@@ -268,23 +268,17 @@ function getLastSignals(statePath) {
 
 // Singleton Guard - prevent multiple evolver daemon instances.
 //
-// Round-4: pidfile location previously defaulted to __dirname, which is a
-// DIFFERENT path per install mode -- /usr/local/lib/node_modules/... for a
-// global install, the dev-clone path for `node index.js`, a transient
-// $NPM_CACHE/_npx/<hash> for `npx evolver`. Two daemons launched under
-// different install modes never saw each other's lock and could run
-// concurrently against the same ~/.evomap/node_secret, ping-ponging on
-// secret rotation and silently entering reauth backoff -- the user-
-// reported "first launch ok, idle, then dead forever" pattern. Default
-// now lives under the per-user state dir so all install modes converge.
-// EVOLVER_LOCK_DIR still overrides for tests / sandboxed runs.
-function getLockFilePath() {
-  if (process.env.EVOLVER_LOCK_DIR) {
-    return path.join(process.env.EVOLVER_LOCK_DIR, 'evolver.pid');
-  }
-  // os.homedir() is cross-platform; process.env.HOME is unset on Windows.
-  return path.join(os.homedir(), '.evomap', 'instance.lock');
-}
+// Lock location + lease tunables live in src/adapters/scripts/_lockPaths.js
+// (issue #176): the session-start hook's auto-restart guard needs the exact
+// same resolution, and inlining it in both places drifted. The Round-4
+// (per-install-mode pidfile convergence) and Round-9 (lease staleness)
+// history notes moved there with the code.
+const {
+  getLockFilePath,
+  lockIsStaleByLease: _lockIsStaleByLease,
+  STALE_LOCK_TTL_MS,
+  LOCK_REFRESH_MS,
+} = require('./src/adapters/scripts/_lockPaths');
 
 function _writeLockAtomic(lockFile, payload) {
   // Round-6 (§19.8): the previous implementation used tmp + rename, which
@@ -372,37 +366,10 @@ function _lockPayload() {
   });
 }
 
-// Round-9: lease tunables for the daemon lock. A live daemon refreshes the
-// lock mtime every LOCK_REFRESH_MS; a lock whose mtime is older than
-// STALE_LOCK_TTL_MS (and that was written by a lease-aware daemon) is
-// treated as stale even if its PID happens to be alive -- closing the
-// "crash + PID reuse -> new daemon silently refuses to start" hole and the
-// "SIGKILL leaves a stale lock nobody reclaims" hole. The TTL is well above
-// the heartbeat interval (default 6min) so a healthy daemon never trips it.
-// On Windows, SIGTERM is implemented as TerminateProcess() (not a catchable
-// signal), so the shutdown() handler that calls releaseLock() never runs.
-// The lock file stays on disk with the dead PID. Reduce the TTL on Windows
-// so a subsequent start doesn't wait 15 minutes to reclaim the stale lock.
-// Unix dropped from 15 min -> 5 min so a wedged daemon does not block takeover
-// for a quarter hour. 5 min is still 2.5x the 2-min Unix refresh cadence.
-// Windows 3 min TTL gets a 1-min refresh (3x margin) since 2-min refresh left
-// only 1.5x margin against transient FS hiccups.
-const STALE_LOCK_TTL_MS = process.platform === 'win32' ? 3 * 60_000 : 5 * 60_000;
-const LOCK_REFRESH_MS = process.platform === 'win32' ? 1 * 60_000 : 2 * 60_000;
+// STALE_LOCK_TTL_MS / LOCK_REFRESH_MS / _lockIsStaleByLease come from
+// src/adapters/scripts/_lockPaths.js (required next to getLockFilePath
+// above) — see issue #176 and the Round-9 history note in that module.
 let _lockRefreshTimer = null;
-
-// Returns true if the lock was written by a lease-aware daemon AND its
-// mtime is older than the stale TTL -- i.e. no live owner is refreshing it,
-// so it is safe to reclaim regardless of whether the recorded PID resolves.
-function _lockIsStaleByLease(lockFile, payload) {
-  if (!payload || payload.lease !== true) return false;
-  try {
-    const ageMs = Date.now() - fs.statSync(lockFile).mtimeMs;
-    return ageMs > STALE_LOCK_TTL_MS;
-  } catch (_) {
-    return false;
-  }
-}
 
 // Start refreshing the lock file's mtime so other processes can tell this
 // daemon is alive without trusting a (recyclable) PID. unref'd: it never

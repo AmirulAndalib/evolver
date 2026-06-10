@@ -141,12 +141,13 @@ describe('hookAdapter', () => {
         const evolverRoot = path.resolve(__dirname, '..');
         const copied = hookAdapter.copyHookScripts(destDir, path.join(evolverRoot, 'src', 'adapters'));
         // 4 hook entry points (session-start, signal-detect, session-end,
-        // task-recall) + 2 helpers (`_runtimePaths.js`, `_memoryFiltering.js`)
-        // required by them via `require('./...')`. Helper list is verified
-        // separately by the "#547 — setup-hooks copies every helper required by
-        // the entry-point scripts" suite, which scans the actual `require`
-        // statements; this assertion is just a quick smoke test on count.
-        assert.equal(copied.length, 6);
+        // task-recall) + 3 helpers (`_runtimePaths.js`, `_memoryFiltering.js`,
+        // `_lockPaths.js`) required by them via `require('./...')`. Helper
+        // list is verified separately by the "#547 — setup-hooks copies every
+        // helper required by the entry-point scripts" suite, which scans the
+        // actual `require` statements; this assertion is just a quick smoke
+        // test on count.
+        assert.equal(copied.length, 7);
         for (const f of copied) {
           assert.ok(fs.existsSync(f));
         }

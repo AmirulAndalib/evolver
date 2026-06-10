@@ -168,6 +168,7 @@ function copyHookScripts(destDir, evolverRoot) {
   const scripts = [
     '_runtimePaths.js',
     '_memoryFiltering.js',
+    '_lockPaths.js',
     'evolver-session-start.js',
     'evolver-signal-detect.js',
     'evolver-session-end.js',
@@ -255,6 +256,7 @@ function removeHookScripts(hooksDir) {
   const scripts = [
     '_runtimePaths.js',
     '_memoryFiltering.js',
+    '_lockPaths.js',
     'evolver-session-start.js',
     'evolver-signal-detect.js',
     'evolver-session-end.js',

@@ -476,6 +476,27 @@ describe('EvoMapProxy._proxyBedrock', () => {
     assert.equal('context_management' in sent, false, 'context_management must still be stripped');
   });
 
+  it('thinking: adaptive and output_config pass through for Opus 4.8', async () => {
+    const mock = makeMockSdk({
+      invoke: () => ({ body: Buffer.from('{}') }),
+      stream: () => { throw new Error('should not be called'); },
+    });
+    proxy._bedrockSdk = mock.sdk;
+    await proxy._proxyBedrock('/v1/messages', {
+      model: 'global.anthropic.claude-opus-4-8',
+      max_tokens: 8192,
+      messages: [{ role: 'user', content: 'compact this session' }],
+      thinking: { type: 'adaptive' },
+      output_config: { effort: 'xhigh' },
+      context_management: { edits: [] },
+    }, { bedrockCredentials: { accessKeyId: 't', secretAccessKey: 't' } });
+
+    const sent = JSON.parse(mock.inspect().lastCommand.input.body);
+    assert.deepEqual(sent.thinking, { type: 'adaptive' });
+    assert.deepEqual(sent.output_config, { effort: 'xhigh' });
+    assert.equal('context_management' in sent, false, 'context_management must still be stripped');
+  });
+
   // CC v2.1.150+ adds top-level fields Bedrock InvokeModel doesn't accept;
   // unknown top-level keys cause it to 400 the whole call.
   it('strips CC-specific top-level fields (output_config, context_management) before forwarding to Bedrock', async () => {

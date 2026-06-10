@@ -4,7 +4,7 @@ const { getEvomapPath } = require('../gep/paths');
 const { MailboxStore } = require('./mailbox/store');
 const { ProxyHttpServer } = require('./server/http');
 const { buildRoutes } = require('./server/routes');
-const { buildMessagesHandler, canonicalizeForBedrock } = require('./router/messages_route');
+const { buildMessagesHandler, canonicalizeForBedrock, supportsAdaptiveThinking } = require('./router/messages_route');
 const { SyncEngine } = require('./sync/engine');
 const { LifecycleManager } = require('./lifecycle/manager');
 const { TaskMonitor } = require('./task/monitor');
@@ -445,8 +445,8 @@ class EvoMapProxy {
     delete upstreamBody.stream;
 
     // Claude Code v2.1.150+ sends `thinking: { type: 'adaptive' }` plus
-    // `output_config.effort` for Opus 4.7+. Keep that shape for 4.7 models:
-    // folding it to `enabled` makes the current 4.7 endpoint reject compaction
+    // `output_config.effort` for Opus 4.7+. Keep that shape for those models:
+    // folding it to `enabled` makes current 4.7+ endpoints reject compaction
     // with: "thinking.type.enabled is not supported for this model".
     //
     // Older Bedrock-deployed 4.5/4.1 generation models only accept
@@ -461,7 +461,7 @@ class EvoMapProxy {
     // thinking entirely on those calls — fold to 'disabled'. For larger
     // max_tokens we default to max_tokens/2 (the model picks budget in
     // adaptive mode, but Bedrock 'enabled' requires the field).
-    const modelSupportsAdaptiveThinking = /claude-(opus|sonnet|haiku)-4-7\b/.test(modelId);
+    const modelSupportsAdaptiveThinking = supportsAdaptiveThinking(modelId);
     if (
       !modelSupportsAdaptiveThinking
       && upstreamBody.thinking

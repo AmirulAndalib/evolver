@@ -152,7 +152,8 @@ describe('executeForceUpdate: idempotency short-circuit', () => {
 
     const result = executeForceUpdate({ required_version: '>=v1.88.3' });
 
-    assert.equal(result, false, 'older current version must not skip a leading-v required floor');
+    assert.equal(result.ok, false, 'older current version must not skip a leading-v required floor');
+    assert.equal(result.code, 'degit_failed', 'degit throw classified as degit_failed');
     assert.equal(execFileCalls, 1, 'Channel 1 (degit) was attempted exactly once');
   });
 
@@ -197,7 +198,8 @@ describe('executeForceUpdate: idempotency short-circuit', () => {
 
     const result = executeForceUpdate({ required_version: '>=1.0.0-9007199254740993' });
 
-    assert.equal(result, false, 'older oversized prerelease must fall through to the upgrade path');
+    assert.equal(result.ok, false, 'older oversized prerelease must fall through to the upgrade path');
+    assert.equal(result.code, 'degit_failed', 'degit throw classified as degit_failed');
     assert.equal(execFileCalls, 1, 'Channel 1 (degit) was attempted exactly once');
   });
 
@@ -228,7 +230,8 @@ describe('executeForceUpdate: idempotency short-circuit', () => {
 
       const result = executeForceUpdate({ required_version: requiredVersion });
 
-      assert.equal(result, false, 'older oversized core semver must fall through to the upgrade path');
+      assert.equal(result.ok, false, 'older oversized core semver must fall through to the upgrade path');
+      assert.equal(result.code, 'degit_failed', 'degit throw classified as degit_failed');
       assert.equal(execFileCalls, 1, 'Channel 1 (degit) was attempted exactly once');
     }
   });
@@ -264,7 +267,8 @@ describe('executeForceUpdate: idempotency short-circuit', () => {
 
     const result = executeForceUpdate({ required_version: '1.88.0' });
 
-    assert.equal(result, false, 'no short-circuit; degit failure -> false');
+    assert.equal(result.ok, false, 'no short-circuit; degit failure -> structured failure');
+    assert.equal(result.code, 'degit_failed', 'degit throw classified as degit_failed');
     assert.equal(execFileCalls, 1, 'Channel 1 (degit) was attempted exactly once');
   });
 
@@ -279,7 +283,8 @@ describe('executeForceUpdate: idempotency short-circuit', () => {
 
     const result = executeForceUpdate({ required_version: '>=1.88.0' });
 
-    assert.equal(result, false, 'prerelease must not satisfy stable force-update floor');
+    assert.equal(result.ok, false, 'prerelease must not satisfy stable force-update floor');
+    assert.equal(result.code, 'degit_failed', 'degit throw classified as degit_failed');
     assert.equal(execFileCalls, 1, 'Channel 1 (degit) was attempted exactly once');
   });
 
@@ -294,7 +299,9 @@ describe('executeForceUpdate: idempotency short-circuit', () => {
 
     const result = executeForceUpdate({ required_version: '>=1.88.3' });
 
-    assert.equal(result, false, 'invalid current version must fail closed');
+    assert.equal(result.ok, false, 'invalid current version must fail closed');
+    assert.equal(result.code, 'current_version_unparsable',
+      'unparseable installed version → current_version_unparsable (the new #213 anti-downgrade guard branch)');
     assert.equal(execFileCalls, 0, 'Channel 1 (degit) must NOT be attempted with invalid current version');
   });
 
@@ -311,7 +318,8 @@ describe('executeForceUpdate: idempotency short-circuit', () => {
 
     const result = executeForceUpdate({ required_version: 'garbage' });
 
-    assert.equal(result, false, 'parse failure must return false');
+    assert.equal(result.ok, false, 'parse failure must return a structured failure');
+    assert.equal(result.code, 'bad_required_version', 'garbage required_version → bad_required_version');
     assert.equal(execFileCalls, 0, 'execFileSync never reached (rejected before Channel 1)');
   });
 });

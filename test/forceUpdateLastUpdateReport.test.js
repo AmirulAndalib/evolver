@@ -810,7 +810,60 @@ describe('force_update last_update reporting', () => {
     var payload = JSON.parse(fs.readFileSync(_statePath(), 'utf8'));
     assert.equal(payload.status, 'failed');
     assert.equal(payload.to_version, '1.88.0');
-    assert.equal(payload.error, 'boom');
+    // A THROWN error (no structured failure) is prefixed with the
+    // `unexpected_error` code so every failed row carries a "code: detail"
+    // shape for GROUP BY split_part(error, ':', 1). executeForceUpdate now
+    // catches its own Channel 1 errors and RETURNS structured failures, so
+    // this thrown path is the rare "threw outside the inner try" case.
+    assert.equal(payload.error, 'unexpected_error: boom');
+  });
+
+  it('(u2) structured failure encodes as "code: detail" (the headline feature)', () => {
+    assert.ok(!fs.existsSync(_statePath()));
+    reportForceUpdateOutcome(
+      { required_version: '>=1.88.3' },
+      { updated: false, failure: { ok: false, code: 'degit_failed', detail: 'spawn npx ENOENT' } }
+    );
+    var payload = JSON.parse(fs.readFileSync(_statePath(), 'utf8'));
+    assert.equal(payload.status, 'failed');
+    // This is the whole point: the hub can now `GROUP BY split_part(error, ':', 1)`
+    // instead of seeing N rows of the identical "executeForceUpdate returned false".
+    assert.equal(payload.error, 'degit_failed: spawn npx ENOENT');
+  });
+
+  it('(u3) structured failure with empty detail persists the bare code', () => {
+    reportForceUpdateOutcome(
+      { required_version: '>=1.88.3' },
+      { updated: false, failure: { ok: false, code: 'all_channels_exhausted', detail: '' } }
+    );
+    var payload = JSON.parse(fs.readFileSync(_statePath(), 'utf8'));
+    assert.equal(payload.error, 'all_channels_exhausted');
+  });
+
+  it('(u4) structured failure (returned) wins over a thrown error when both are present', () => {
+    reportForceUpdateOutcome(
+      { required_version: '>=1.88.3' },
+      {
+        updated: false,
+        failure: { ok: false, code: 'copy_failed', detail: 'index.js: EPERM' },
+        error: new Error('boom'),
+      }
+    );
+    var payload = JSON.parse(fs.readFileSync(_statePath(), 'utf8'));
+    assert.equal(payload.error, 'copy_failed: index.js: EPERM',
+      'the precise returned-failure code beats the generic thrown error; legacy fallback never appears');
+  });
+
+  it('(u5) structured failure detail is redacted before persisting (degit stderr can carry tokens)', () => {
+    var token = 'npm_' + 'c'.repeat(36);
+    reportForceUpdateOutcome(
+      { required_version: '>=1.88.3' },
+      { updated: false, failure: { ok: false, code: 'degit_failed', detail: 'registry 401 token=' + token } }
+    );
+    var payload = JSON.parse(fs.readFileSync(_statePath(), 'utf8'));
+    assert.ok(payload.error.startsWith('degit_failed: '), 'code prefix preserved for GROUP BY');
+    assert.ok(!payload.error.includes(token), 'a token in the detail must be redacted');
+    assert.ok(/\[REDACTED\]/.test(payload.error), 'redaction marker present');
   });
 
   it('(v) reportForceUpdateOutcome public API: unparsable required_version writes nothing', async () => {
@@ -1204,8 +1257,10 @@ describe('force_update last_update reporting', () => {
     assert.ok(/\[REDACTED\]/.test(payload.error),
       'at least one redaction marker must be present');
     // The non-sensitive prefix must survive so operators still see what failed.
-    assert.ok(payload.error.startsWith('npm install failed'),
-      'redactor preserves the message structure / leading context');
+    // (A thrown error is now code-prefixed with `unexpected_error: ` — the
+    // original message still leads the rest of the string.)
+    assert.ok(payload.error.startsWith('unexpected_error: npm install failed'),
+      'redactor preserves the message structure / leading context after the code prefix');
   });
 
   // (ll) Companion to (kk): redact runs BEFORE the ERROR_MAX truncation,

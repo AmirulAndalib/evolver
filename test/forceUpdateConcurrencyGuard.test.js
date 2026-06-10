@@ -150,8 +150,10 @@ describe('executeForceUpdate: module-level concurrency guard', () => {
       're-entrant call during in-flight upgrade returns FORCE_UPDATE_BUSY');
     assert.equal(reentrantExecCalls, 0,
       're-entrant call MUST NOT reach degit (mutex short-circuit before _executeForceUpdateInner)');
-    assert.equal(outerResult, false,
-      'outer call still returns its normal result (false on degit failure)');
+    assert.equal(outerResult.ok, false,
+      'outer call still returns its normal failure result (structured fail on degit failure)');
+    assert.equal(outerResult.code, 'degit_failed',
+      'outer failure carries the degit_failed code (was a bare false before structured failures)');
     assert.ok(outerExecCalls >= 1,
       'outer call did reach degit at least once');
   });
@@ -165,14 +167,16 @@ describe('executeForceUpdate: module-level concurrency guard', () => {
     };
     const mod = freshRequireForceUpdate(stub);
 
-    // First call: enters _executeForceUpdateInner, fails at degit, returns false.
+    // First call: enters _executeForceUpdateInner, fails at degit, returns a
+    // structured { ok:false, code:'degit_failed' } (was a bare false).
     const r1 = mod.executeForceUpdate({ required_version: '1.88.0' });
-    assert.equal(r1, false);
+    assert.equal(r1.ok, false);
+    assert.equal(r1.code, 'degit_failed', 'degit throw classified as degit_failed');
     assert.equal(execCalls, 1, 'first call reached degit');
 
     // Second call AFTER first completes: must NOT be blocked by a stuck mutex.
     const r2 = mod.executeForceUpdate({ required_version: '1.88.0' });
-    assert.equal(r2, false, 'mutex released; second call ran normally');
+    assert.equal(r2.ok, false, 'mutex released; second call ran normally');
     assert.equal(execCalls, 2, 'second call also reached degit (no stale BUSY)');
   });
 
@@ -186,9 +190,12 @@ describe('executeForceUpdate: module-level concurrency guard', () => {
     const stub = function () { throw new Error('unreachable'); };
     const mod = freshRequireForceUpdate(stub);
 
-    // First call: refuses (missing package.json), returns false.
+    // First call: refuses (missing package.json), returns a structured
+    // { ok:false, code:'install_guard_unreadable' } (was a bare false).
     const r1 = mod.executeForceUpdate({ required_version: '1.88.0' });
-    assert.equal(r1, false, 'missing pkg returns false');
+    assert.equal(r1.ok, false, 'missing pkg returns a structured failure');
+    assert.equal(r1.code, 'install_guard_unreadable',
+      'missing/unreadable install package.json → install_guard_unreadable');
 
     // Recreate install root for next call.
     fs.mkdirSync(installRoot, { recursive: true });
@@ -215,7 +222,7 @@ describe('executeForceUpdate: module-level concurrency guard', () => {
     mod._resetInFlightForTesting();
     // After reset, a fresh call should still proceed.
     const r = mod.executeForceUpdate({ required_version: '1.88.0' });
-    assert.equal(r, false, 'reset hook works and is idempotent');
+    assert.equal(r.ok, false, 'reset hook works and is idempotent');
   });
 });
 

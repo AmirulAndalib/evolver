@@ -265,6 +265,11 @@ function _maybeTriggerForceUpdateFromHeartbeat(forceUpdate, logger) {
     let noop = false;
     let busy = false;
     let thrownErr = null;
+    // Structured failure object ({ ok:false, code, detail }) when the upgrader
+    // RETURNED a failure; forwarded to reportForceUpdateOutcome so the hub gets
+    // the precise branch code instead of "executeForceUpdate returned false".
+    // Hoisted out of the try because `result` is block-scoped there.
+    let failureResult = null;
     try {
       const mod = require('../../forceUpdate');
       const result = mod.executeForceUpdate(forceUpdate);
@@ -286,6 +291,11 @@ function _maybeTriggerForceUpdateFromHeartbeat(forceUpdate, logger) {
       // src/gep/a2aProtocol.js (search FORCE_UPDATE_BUSY).
       busy = (result === mod.FORCE_UPDATE_BUSY);
       updated = (result === true);
+      // Inline the failure-shape check rather than calling mod.isForceUpdateFailure:
+      // keeps this robust against partial test mocks of forceUpdate that stub
+      // executeForceUpdate but omit the helper (a missing-function throw here
+      // would otherwise demote a real success to "failed").
+      failureResult = (result && typeof result === 'object' && result.ok === false) ? result : null;
     } catch (e) {
       thrownErr = e;
       try {
@@ -311,6 +321,7 @@ function _maybeTriggerForceUpdateFromHeartbeat(forceUpdate, logger) {
         updated: updated,
         noop: noop,
         error: thrownErr,
+        failure: failureResult,
         fromVersion: fromVersion,
       });
     } catch (e) {

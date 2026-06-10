@@ -20,7 +20,9 @@ const assert = require('node:assert/strict');
 const {
   buildMessagesHandler,
   canonicalizeForBedrock,
+  DEFAULT_TIER_MODELS,
   KNOWN_BEDROCK_ALIASES,
+  supportsAdaptiveThinking,
 } = require('../src/proxy/router/messages_route');
 
 function makeStubProxy(handler) {
@@ -64,6 +66,18 @@ describe('canonicalizeForBedrock', () => {
     }
   });
 
+  it('keeps shipped default tier models on Bedrock-resolvable aliases', () => {
+    assert.deepEqual(Object.values(DEFAULT_TIER_MODELS), [
+      'global.anthropic.claude-opus-4-7',
+      'global.anthropic.claude-opus-4-7',
+      'global.anthropic.claude-opus-4-7',
+    ]);
+    for (const model of Object.values(DEFAULT_TIER_MODELS)) {
+      assert.ok(Object.values(KNOWN_BEDROCK_ALIASES).includes(model),
+        'default tier model must be a known Bedrock alias: ' + model);
+    }
+  });
+
   it('passes through unknown / non-Claude IDs untouched', () => {
     assert.equal(canonicalizeForBedrock('gpt-4'), 'gpt-4');
     assert.equal(canonicalizeForBedrock('mistral-large-2'), 'mistral-large-2');
@@ -81,6 +95,22 @@ describe('canonicalizeForBedrock', () => {
       canonicalizeForBedrock('us.anthropic.claude-haiku-4-5-20251001-v1:0'),
       'global.anthropic.claude-haiku-4-5-20251001-v1:0',
     );
+  });
+});
+
+describe('supportsAdaptiveThinking', () => {
+  it('treats Claude 4.7+ as adaptive-thinking capable', () => {
+    assert.equal(supportsAdaptiveThinking('global.anthropic.claude-opus-4-7'), true);
+    assert.equal(supportsAdaptiveThinking('global.anthropic.claude-opus-4-8'), true);
+    assert.equal(supportsAdaptiveThinking('global.anthropic.claude-sonnet-4-10'), true);
+    assert.equal(supportsAdaptiveThinking('global.anthropic.claude-opus-5-1'), true);
+  });
+
+  it('keeps older or opaque models on legacy Bedrock thinking conversion', () => {
+    assert.equal(supportsAdaptiveThinking('global.anthropic.claude-haiku-4-5-20251001-v1:0'), false);
+    assert.equal(supportsAdaptiveThinking('global.anthropic.claude-opus-4-1-20250805-v1:0'), false);
+    assert.equal(supportsAdaptiveThinking('mistral-large-2'), false);
+    assert.equal(supportsAdaptiveThinking(null), false);
   });
 });
 

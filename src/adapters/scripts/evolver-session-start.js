@@ -9,6 +9,10 @@ const os = require('os');
 
 const { findEvolverRoot, findMemoryGraph, resolveProjectDir, resolveWorkspaceId, isGitWorkspace } = require('./_runtimePaths');
 const { filterRelevantOutcomes } = require('./_memoryFiltering');
+// Top-level on purpose: a missing sibling helper in the deployed hooks dir
+// must fail LOUD at load time (the #547 failure mode), not vanish inside
+// _maybeRestartDaemon's catch-all and silently disable daemon auto-restart.
+const lockPaths = require('./_lockPaths');
 
 // Auto-restart guard: if the evolver daemon is not running when a new agent
 // session starts, attempt a background restart. This covers the "idle-death"
@@ -35,43 +39,31 @@ function _maybeRestartDaemon(evolverRoot) {
     if (!lifecyclePath || !fs.existsSync(lifecyclePath)) return;
 
     // Check if daemon is running by looking for the PID file / lock file.
-    // R12: index.js:getLockFilePath honors EVOLVER_LOCK_DIR. If that env is
-    // set the lock file lives at <EVOLVER_LOCK_DIR>/evolver.pid (basename
-    // differs from the default!); otherwise fall back to the canonical
-    // ~/.evomap/instance.lock. We replicate the logic inline rather than
-    // importing index.js, since pulling the daemon module into the hook
-    // would load far more than we need.
-    var lockFile = process.env.EVOLVER_LOCK_DIR
-      ? path.join(process.env.EVOLVER_LOCK_DIR, 'evolver.pid')
-      : path.join(os.homedir(), '.evomap', 'instance.lock');
-    // R1: PID-reuse defense. process.kill(pid, 0) only proves SOME process
-    // owns that PID -- after macOS sleep / OOM, the kernel may have reused
-    // the slain daemon's PID for an unrelated process (Chrome tab, shell).
-    // Mirror index.js:_lockIsStaleByLease (search for STALE_LOCK_TTL_MS
-    // around line 373): a lease-aware daemon refreshes the lock mtime on a
-    // timer, so if mtime is older than the TTL the daemon is dead/wedged
-    // regardless of kill(0). Constants inlined to keep index.js out of the
-    // hook's require graph.
-    var STALE_LOCK_TTL_MS = process.platform === 'win32' ? 3 * 60_000 : 5 * 60_000;
+    // Lock resolution + lease staleness live in ./_lockPaths (issue #176) —
+    // the same module index.js uses, so the hook can never drift from the
+    // daemon again. It is fs/os/path-only, keeping index.js out of the
+    // hook's require graph (R12), and ships in hookAdapter.js's copy list
+    // for the deployed `.claude/hooks/` layout (PR #163).
+    var lockFile = lockPaths.getLockFilePath();
     var daemonRunning = false;
     try {
       if (fs.existsSync(lockFile)) {
         var raw = fs.readFileSync(lockFile, 'utf8').trim();
         var payload = raw && raw[0] === '{' ? JSON.parse(raw) : { pid: parseInt(raw, 10) };
         if (payload && payload.pid > 0) {
+          // R1: PID-reuse defense. process.kill(pid, 0) only proves SOME
+          // process owns that PID -- after macOS sleep / OOM, the kernel may
+          // have reused the slain daemon's PID for an unrelated process.
           try { process.kill(payload.pid, 0); daemonRunning = true; } catch (e) {
             // EPERM = process exists but owned by a different user; still a live daemon.
             if (e && e.code === 'EPERM') daemonRunning = true;
           }
-          // Lease staleness overrides kill(0)=alive. Only trust mtime when
-          // the payload came from a lease-aware daemon (matches index.js's
-          // _lockIsStaleByLease guard) so we never falsely steal an older
-          // pre-lease daemon's lock.
-          if (daemonRunning && payload.lease === true) {
-            try {
-              var ageMs = Date.now() - fs.statSync(lockFile).mtimeMs;
-              if (ageMs > STALE_LOCK_TTL_MS) daemonRunning = false;
-            } catch (_) { /* stat failed: leave running flag as-is */ }
+          // Lease staleness overrides kill(0)=alive: a lease-aware daemon
+          // refreshes the lock mtime on a timer, so an expired lease means
+          // dead/wedged regardless of kill(0). Pre-lease locks are never
+          // judged stale by mtime (lockIsStaleByLease handles both).
+          if (daemonRunning && lockPaths.lockIsStaleByLease(lockFile, payload)) {
+            daemonRunning = false;
           }
         }
       }
