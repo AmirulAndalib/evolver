@@ -1,7 +1,7 @@
 const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const config = require('../src/config');
-const { envInt, envPositiveInt, envFloat, envStr, resolveHubUrl } = config;
+const { envInt, envPositiveInt, envFloat, envStr, resolveHubUrl, antiAbuseTelemetryMode } = config;
 
 // All env accessors read process.env on every call (resolveHubUrl is
 // explicitly documented as re-evaluating each call, and the env* helpers
@@ -15,6 +15,7 @@ const TOUCHED_ENV = [
   'EVOMAP_HUB_URL',
   'EVOLVER_DEFAULT_HUB_URL',
   'EVOMAP_HUB_ALLOW_INSECURE',
+  'EVOLVER_ANTI_ABUSE_TELEMETRY',
 ];
 let savedEnv;
 beforeEach(function () {
@@ -148,6 +149,37 @@ describe('envPositiveInt', function () {
     } finally {
       console.warn = origWarn;
     }
+  });
+});
+
+describe('antiAbuseTelemetryMode', function () {
+  it('defaults to heartbeat mode', function () {
+    delete process.env.EVOLVER_ANTI_ABUSE_TELEMETRY;
+    assert.equal(antiAbuseTelemetryMode(), 'heartbeat');
+  });
+  it('allows explicit opt-out', function () {
+    process.env.EVOLVER_ANTI_ABUSE_TELEMETRY = 'off';
+    assert.equal(antiAbuseTelemetryMode(), 'off');
+    process.env.EVOLVER_ANTI_ABUSE_TELEMETRY = 'false';
+    assert.equal(antiAbuseTelemetryMode(), 'off');
+  });
+  it('enables heartbeat mode for explicit truthy values', function () {
+    process.env.EVOLVER_ANTI_ABUSE_TELEMETRY = 'heartbeat';
+    assert.equal(antiAbuseTelemetryMode(), 'heartbeat');
+    process.env.EVOLVER_ANTI_ABUSE_TELEMETRY = 'true';
+    assert.equal(antiAbuseTelemetryMode(), 'heartbeat');
+  });
+  it('keeps unknown values off', function () {
+    process.env.EVOLVER_ANTI_ABUSE_TELEMETRY = 'full';
+    assert.equal(antiAbuseTelemetryMode(), 'off');
+  });
+  it('treats an empty / blank env value as unset (default-on), not as opt-out', function () {
+    // A bare `EVOLVER_ANTI_ABUSE_TELEMETRY=` line in a .env file must not
+    // silently disable the documented default-on behavior (Bugbot, PR #216).
+    process.env.EVOLVER_ANTI_ABUSE_TELEMETRY = '';
+    assert.equal(antiAbuseTelemetryMode(), 'heartbeat');
+    process.env.EVOLVER_ANTI_ABUSE_TELEMETRY = '   ';
+    assert.equal(antiAbuseTelemetryMode(), 'heartbeat');
   });
 });
 

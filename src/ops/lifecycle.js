@@ -6,7 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execSync, spawn } = require('child_process');
+const { execFileSync, execSync, spawn } = require('child_process');
 // 10 MB — prevents RangeError on large child process output (e.g. git log/diff
 // on large repos). See GHSA reports / issue #451.
 const MAX_EXEC_BUFFER = 10 * 1024 * 1024;
@@ -37,9 +37,22 @@ function execText(command) {
     return execSync(command, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: MAX_EXEC_BUFFER });
 }
 
+function execFileText(file, args) {
+    return execFileSync(file, args, {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        maxBuffer: MAX_EXEC_BUFFER,
+        windowsHide: true
+    });
+}
+
 function listProcesses() {
     if (process.platform === 'win32') {
-        var out = execText('powershell -NoProfile -Command "Get-CimInstance Win32_Process | ForEach-Object { $cmd = if ($_.CommandLine) { $_.CommandLine } else { \'\' }; Write-Output (\'{0}\\t{1}\' -f $_.ProcessId, $cmd) }"');
+        var out = execFileText('powershell', [
+            '-NoProfile',
+            '-Command',
+            'Get-CimInstance Win32_Process | ForEach-Object { $cmd = if ($_.CommandLine) { $_.CommandLine } else { \'\'}; Write-Output (\'{0}\t{1}\' -f $_.ProcessId, $cmd) }'
+        ]);
         var procs = [];
         for (var line of out.split(/\r?\n/)) {
             if (!line || !line.trim()) continue;
@@ -132,7 +145,7 @@ function start(options) {
     }
 
     var child = spawn(process.execPath, [script, '--loop'], {
-        detached: true, stdio: ['ignore', out, err], cwd: WORKSPACE_ROOT, env: env
+        detached: true, stdio: ['ignore', out, err], cwd: WORKSPACE_ROOT, env: env, windowsHide: true
     });
     child.unref();
     fs.writeFileSync(PID_FILE, String(child.pid));
@@ -163,7 +176,7 @@ function stop() {
         console.log('[Lifecycle] Force-killing PID ' + remaining[j]);
         // Windows does not support SIGKILL; use taskkill /F instead.
         if (process.platform === 'win32') {
-            try { execSync('taskkill /F /PID ' + remaining[j], { stdio: 'ignore' }); } catch (e) {}
+            try { execFileSync('taskkill', ['/F', '/PID', String(remaining[j])], { stdio: 'ignore', windowsHide: true }); } catch (e) {}
         } else {
             try { process.kill(remaining[j], 'SIGKILL'); } catch (e) {}
         }

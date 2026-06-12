@@ -104,7 +104,7 @@ function resolveTierModels() {
   };
 }
 
-function buildMessagesHandler({ anthropicProxy, logger, routerEnabled, traceStore } = {}) {
+function buildMessagesHandler({ anthropicProxy, logger, routerEnabled, traceStore, onTraceQueued } = {}) {
   if (typeof anthropicProxy !== 'function') {
     throw new Error('buildMessagesHandler requires anthropicProxy(path, body, opts)');
   }
@@ -278,6 +278,8 @@ function buildMessagesHandler({ anthropicProxy, logger, routerEnabled, traceStor
         originalModel,
         chosenModel,
         store: traceStore,
+        logger: traceStore ? log : null,
+        onTraceQueued,
       });
     } catch (_) { /* best-effort trace; never break the request */ }
 
@@ -450,7 +452,8 @@ function buildMessagesHandler({ anthropicProxy, logger, routerEnabled, traceStor
           event: 'router_fallback',
           reason: 'upstream_non_json',
           upstream_status: finalUpstream.status,
-          preview: raw.slice(0, 200),
+          content_type: finalUpstream.headers && finalUpstream.headers['content-type'] || '',
+          response_bytes: Buffer.byteLength(raw),
         }));
       }
     }

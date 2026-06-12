@@ -363,6 +363,7 @@ class LifecycleManager {
     this._heartbeatTimer = null;
     this._running = false;
     this._startedAt = null;
+    this._lastHeartbeatTickAt = 0;
     this._consecutiveFailures = 0;
     this._reauthInProgress = false;
     this._helloRateLimitUntil = 0;
@@ -761,6 +762,25 @@ class LifecycleManager {
         },
       };
 
+      try {
+        const cfg = require('../../config');
+        if (cfg.antiAbuseTelemetryMode && cfg.antiAbuseTelemetryMode() === 'heartbeat') {
+          const { buildHeartbeatAntiAbuseTelemetry } = require('../../gep/antiAbuseTelemetry');
+          body.meta.anti_abuse = buildHeartbeatAntiAbuseTelemetry({
+            source: 'evolver-proxy',
+            nodeId: this.nodeId,
+            envFingerprint: fp,
+            taskMeta: body.meta,
+            // This heartbeat is sent FROM the running proxy — ground truth,
+            // not env sniffing (this process usually has neither EVOMAP_PROXY
+            // nor EVOMAP_PROXY_PORT set, which would misreport false).
+            proxyPortConfigured: true,
+          });
+        }
+      } catch (e) {
+        this.logger.warn(`[AntiAbuseTelemetry] failed to build heartbeat summary: ${e && e.message || e}`);
+      }
+
       // Attach any pending force_update outcome so the hub-side
       // EvolverUpgradeAttempt table gets a row. Captured in a local so the
       // post-2xx clear matches identity (rotation-safe — see
@@ -1035,6 +1055,7 @@ class LifecycleManager {
 
   async _heartbeatTick(myGen) {
     if (!this._running) return;
+    this._lastHeartbeatTickAt = Date.now();
     // Defence-in-depth: even with heartbeat() now fully wrapped (see
     // its body), an unforeseen synchronous throw inside the awaited
     // path or a defective stub passed in tests would still bubble
@@ -1099,6 +1120,16 @@ class LifecycleManager {
       clearInterval(this._driftInterval);
       this._driftInterval = null;
     }
+  }
+
+  getHeartbeatStats() {
+    return {
+      running: this._running,
+      intervalMs: this._heartbeatInterval || DEFAULT_HEARTBEAT_INTERVAL,
+      uptimeMs: this._startedAt ? Date.now() - this._startedAt : 0,
+      consecutiveFailures: this._consecutiveFailures,
+      lastTickAt: this._lastHeartbeatTickAt,
+    };
   }
 
   _shouldUpgrade(minVersion) {

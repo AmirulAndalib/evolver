@@ -257,6 +257,18 @@ describe('MailboxStore', () => {
       assert.equal(store2.countPending({ direction: 'inbound' }), 1);
       store2.close();
     });
+
+    it('counts pending messages by type', () => {
+      const store2 = new MailboxStore(tmpDataDir());
+      store2.send({ type: 'proxy_trace', payload: {} });
+      store2.send({ type: 'asset_submit', payload: {} });
+      store2.writeInbound({ type: 'proxy_trace_config', payload: {} });
+
+      assert.equal(store2.countPending({ direction: 'outbound', type: 'proxy_trace' }), 1);
+      assert.equal(store2.countPending({ direction: 'outbound', type: 'asset_submit' }), 1);
+      assert.equal(store2.countPending({ direction: 'inbound', type: 'proxy_trace_config' }), 1);
+      store2.close();
+    });
   });
 
   describe('sync cursors', () => {
@@ -283,6 +295,53 @@ describe('MailboxStore', () => {
       store.setState('counter', '1');
       store.setState('counter', '2');
       assert.equal(store.getState('counter'), '2');
+    });
+
+    it('creates mailbox state files with owner-only permissions', {
+      skip: process.platform === 'win32' ? 'chmod not enforced on Windows' : false,
+    }, () => {
+      const parent = tmpDataDir();
+      const dir = path.join(parent, 'mailbox');
+      const oldUmask = process.umask(0o022);
+      let s;
+      try {
+        s = new MailboxStore(dir);
+        s.setState('node_secret', 'a'.repeat(64));
+        s.send({ type: 'permission_probe', payload: { ok: true } });
+
+        assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+        assert.equal(fs.statSync(s._stateFile).mode & 0o777, 0o600);
+        assert.equal(fs.statSync(s._messagesFile).mode & 0o777, 0o600);
+      } finally {
+        process.umask(oldUmask);
+        if (s) s.close();
+        try { fs.rmSync(parent, { recursive: true }); } catch {}
+      }
+    });
+
+    it('tightens existing mailbox directory and state file permissions', {
+      skip: process.platform === 'win32' ? 'chmod not enforced on Windows' : false,
+    }, () => {
+      const parent = tmpDataDir();
+      const dir = path.join(parent, 'mailbox');
+      const stateFile = path.join(dir, 'state.json');
+      fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+      fs.chmodSync(dir, 0o755);
+      fs.writeFileSync(stateFile, JSON.stringify({ node_secret: 'b'.repeat(64) }) + '\n', {
+        encoding: 'utf8',
+        mode: 0o644,
+      });
+      fs.chmodSync(stateFile, 0o644);
+
+      const s = new MailboxStore(dir);
+      try {
+        assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+        assert.equal(fs.statSync(s._stateFile).mode & 0o777, 0o600);
+        assert.equal(s.getState('node_secret'), 'b'.repeat(64));
+      } finally {
+        s.close();
+        try { fs.rmSync(parent, { recursive: true }); } catch {}
+      }
     });
   });
 

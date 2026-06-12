@@ -5,6 +5,7 @@ const { MailboxStore } = require('./mailbox/store');
 const { ProxyHttpServer } = require('./server/http');
 const { buildRoutes } = require('./server/routes');
 const { buildMessagesHandler, canonicalizeForBedrock, supportsAdaptiveThinking } = require('./router/messages_route');
+const { buildResponsesHandler } = require('./router/responses_route');
 const { SyncEngine } = require('./sync/engine');
 const { LifecycleManager } = require('./lifecycle/manager');
 const { TaskMonitor } = require('./task/monitor');
@@ -12,9 +13,54 @@ const { SkillUpdater } = require('./extensions/skillUpdater');
 const { DmHandler } = require('./extensions/dmHandler');
 const { SessionHandler } = require('./extensions/sessionHandler');
 const { TraceControl } = require('./extensions/traceControl');
+const { backfillProxyTraceUploads } = require('./trace/extractor');
+
+const TRACE_BACKFILL_DRAIN_MAX_PASSES = 8;
+const TRACE_BACKFILL_STARTUP_DRAIN_MAX_MS = 250;
+const TRACE_BACKFILL_RUNTIME_DRAIN_MAX_MS = 50;
 
 // Lazy via paths.getEvomapPath() — honors EVOLVER_HOME (#114).
 function _defaultDataDir() { return getEvomapPath('mailbox'); }
+
+const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1';
+
+function isAllowedOpenAIHostname(hostname) {
+  const h = String(hostname || '').toLowerCase();
+  return h === 'api.openai.com' || h.endsWith('.api.openai.com');
+}
+
+function resolveOpenAIBaseUrl(raw, { trustedOverride = false } = {}) {
+  const value = String(raw || DEFAULT_OPENAI_BASE_URL).replace(/\/+$/, '');
+  if (trustedOverride) return value;
+
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error('[proxy] EVOMAP_OPENAI_BASE_URL is not a valid URL');
+  }
+  if (
+    parsed.protocol !== 'https:'
+    || !isAllowedOpenAIHostname(parsed.hostname)
+    || parsed.pathname !== '/v1'
+    || parsed.username
+    || parsed.password
+    || parsed.search
+    || parsed.hash
+  ) {
+    throw new Error('[proxy] EVOMAP_OPENAI_BASE_URL must be an OpenAI https://*.api.openai.com/v1 endpoint');
+  }
+  return value;
+}
+
+function makeOpenAIGatewayError(err, fallbackStatus = 502) {
+  const name = err && err.name ? String(err.name) : '';
+  const isTimeout = name === 'TimeoutError' || name === 'AbortError';
+  const out = new Error(isTimeout ? 'openai upstream timed out' : 'openai upstream request failed');
+  out.statusCode = isTimeout ? 504 : fallbackStatus;
+  out.cause = err;
+  return out;
+}
 
 // The hub serves asset signal-search as `GET /a2a/assets/search` with query
 // params (signals, status, limit, fields, domain); `signals`/`fields` are
@@ -64,12 +110,22 @@ function planAssetSearch(body = {}) {
 
 class EvoMapProxy {
   constructor(opts = {}) {
-    this.hubUrl = (opts.hubUrl || process.env.A2A_HUB_URL || '').replace(/\/+$/, '');
+    // evolver#567: default to the canonical Hub URL (config.resolveHubUrl →
+    // https://evomap.ai, honouring the A2A_HUB_URL / EVOMAP_HUB_URL /
+    // EVOLVER_DEFAULT_HUB_URL precedence + https enforcement) instead of '',
+    // so a freshly-launched proxy is Hub-connected out of the box after
+    // `evolver login` rather than silently staying hub-less/offline (which
+    // surfaced as 503 "Hub not configured" and node_id: null over MCP).
+    // opts.hubUrl still overrides everything.
+    const { resolveHubUrl } = require('../config');
+    this.hubUrl = (opts.hubUrl || resolveHubUrl()).replace(/\/+$/, '');
     this.dataDir = opts.dataDir || opts.dbPath || _defaultDataDir();
     this.port = opts.port;
     this.logger = opts.logger || console;
     this._skillPath = opts.skillPath || null;
     this._anthropicBaseUrl = (opts.anthropicBaseUrl || process.env.EVOMAP_ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/+$/, '');
+    this._openaiBaseUrl = String(opts.openaiBaseUrl || process.env.EVOMAP_OPENAI_BASE_URL || DEFAULT_OPENAI_BASE_URL).replace(/\/+$/, '');
+    this._openaiBaseUrlTrusted = !!opts.openaiBaseUrl;
 
     this.store = null;
     this.server = null;
@@ -80,6 +136,7 @@ class EvoMapProxy {
     this.dmHandler = null;
     this.sessionHandler = null;
     this.traceControl = null;
+    this._traceBackfillDraining = false;
     this._started = false;
   }
 
@@ -133,6 +190,9 @@ class EvoMapProxy {
       getHeaders,
       logger: this.logger,
       onAuthError: () => this.lifecycle.reAuthenticate(),
+      onOutboundFlushed: () => this._drainProxyTraceBackfill({
+        maxMs: TRACE_BACKFILL_RUNTIME_DRAIN_MAX_MS,
+      }),
       onInboundReceived: () => {
         try { this.skillUpdater?.pollAndApply(); } catch (e) {
           this.logger?.warn?.('[proxy] skillUpdater.pollAndApply failed:', e.message);
@@ -178,6 +238,13 @@ class EvoMapProxy {
       },
       logger: this.logger,
       traceStore: this.store,
+      onTraceQueued: () => this.sync?.notifyNewOutbound(),
+    });
+    const responsesHandler = buildResponsesHandler({
+      openAIProxy: (reqPath, body, opts) => this._proxyOpenAIResponses(reqPath, body, opts),
+      logger: this.logger,
+      traceStore: this.store,
+      onTraceQueued: () => this.sync?.notifyNewOutbound(),
     });
 
     const routes = buildRoutes(this.store, proxyHandlers, this.taskMonitor, {
@@ -186,6 +253,7 @@ class EvoMapProxy {
       sessionHandler: this.sessionHandler,
       getHubMailboxStatus: () => this._getHubMailboxStatus(),
       messagesHandler,
+      responsesHandler,
     });
 
     const OUTBOUND_ROUTES = [
@@ -228,6 +296,8 @@ class EvoMapProxy {
       this.logger.warn('[proxy] No A2A_HUB_URL set, running in offline/local mode');
     }
 
+    this._drainProxyTraceBackfill({ maxMs: TRACE_BACKFILL_STARTUP_DRAIN_MAX_MS });
+
     this._started = true;
 
     return {
@@ -235,6 +305,66 @@ class EvoMapProxy {
       port: serverInfo.port,
       nodeId: this.lifecycle.nodeId,
     };
+  }
+
+  _runProxyTraceBackfillPass() {
+    try {
+      return backfillProxyTraceUploads({
+        store: this.store,
+        logger: this.logger,
+      });
+    } catch (e) {
+      this.logger.warn('[proxy] trace backfill failed:', e && e.message ? e.message : e);
+      return { queued: 0, reasons: { thrown: 1 } };
+    }
+  }
+
+  _drainProxyTraceBackfill({
+    maxPasses = TRACE_BACKFILL_DRAIN_MAX_PASSES,
+    maxMs = TRACE_BACKFILL_RUNTIME_DRAIN_MAX_MS,
+  } = {}) {
+    if (this._traceBackfillDraining) return { queued: 0, passes: 0, deferred: true };
+    this._traceBackfillDraining = true;
+    const started = Date.now();
+    const total = {
+      queued: 0,
+      scanned: 0,
+      skipped: 0,
+      duplicates: 0,
+      passes: 0,
+      reasons: {},
+    };
+    try {
+      for (let i = 0; i < maxPasses; i++) {
+        const stats = this._runProxyTraceBackfillPass();
+        total.passes += 1;
+        total.queued += stats.queued || 0;
+        total.scanned += stats.scanned || 0;
+        total.skipped += stats.skipped || 0;
+        total.duplicates += stats.duplicates || 0;
+        for (const [reason, count] of Object.entries(stats.reasons || {})) {
+          total.reasons[reason] = (total.reasons[reason] || 0) + count;
+        }
+        const madeProgress = (stats.scanned || 0) > 0
+          || (stats.queued || 0) > 0
+          || (stats.skipped || 0) > 0
+          || (stats.duplicates || 0) > 0;
+        if (!madeProgress) break;
+        if (stats.reasons?.max_pending_uploads || stats.reasons?.collection_disabled
+          || stats.reasons?.missing_file || stats.reasons?.missing_store
+          || stats.reasons?.read_failed || stats.reasons?.thrown) {
+          break;
+        }
+        if (Date.now() - started >= maxMs) break;
+      }
+    } finally {
+      this._traceBackfillDraining = false;
+    }
+    if (total.queued > 0) {
+      this.logger.log('[proxy] queued ' + total.queued + ' existing proxy trace upload(s)');
+      this.sync?.notifyNewOutbound();
+    }
+    return total;
   }
 
   async stop() {
@@ -394,6 +524,83 @@ class EvoMapProxy {
       stream: isStream ? res.body : null,
       json: isStream ? null : () => res.json(),
       text: () => res.text(),
+    };
+  }
+
+  // OpenAI Responses-compatible passthrough for Codex custom providers. The
+  // proxy token is consumed by ProxyHttpServer and must never be forwarded as
+  // upstream auth; the daemon supplies the real upstream key from env.
+  async _proxyOpenAIResponses(reqPath, body, opts = {}) {
+    const baseUrl = resolveOpenAIBaseUrl(opts.baseUrl || this._openaiBaseUrl || DEFAULT_OPENAI_BASE_URL, {
+      trustedOverride: !!opts.baseUrl || this._openaiBaseUrlTrusted,
+    });
+    const inbound = opts.inboundHeaders || {};
+    const timeoutMs = opts.timeoutMs || 60_000;
+
+    const fwd = { 'content-type': 'application/json' };
+    for (const [k, v] of Object.entries(inbound)) {
+      if (v === undefined || v === null) continue;
+      const lk = k.toLowerCase();
+      if (
+        lk === 'openai-organization'
+        || lk === 'openai-project'
+        || lk === 'openai-beta'
+        || lk.startsWith('x-stainless-')
+      ) {
+        fwd[lk] = Array.isArray(v) ? v.join(', ') : String(v);
+      }
+    }
+
+    const upstreamKey = process.env.EVOMAP_OPENAI_API_KEY || process.env.OPENAI_API_KEY || '';
+    if (!upstreamKey) {
+      const err = new Error('openai api key required');
+      err.statusCode = 401;
+      throw err;
+    }
+    if (upstreamKey) {
+      fwd.authorization = `Bearer ${upstreamKey}`;
+    }
+
+    const endpoint = `${baseUrl}${reqPath}`;
+    const abortController = new AbortController();
+    const timeoutErr = new Error('openai upstream timed out');
+    timeoutErr.name = 'TimeoutError';
+    const abortTimer = setTimeout(() => abortController.abort(timeoutErr), timeoutMs);
+    abortTimer.unref?.();
+    let res;
+    try {
+      res = await fetch(endpoint, {
+        method: 'POST',
+        headers: fwd,
+        body: JSON.stringify(body || {}),
+        signal: abortController.signal,
+      });
+    } catch (err) {
+      clearTimeout(abortTimer);
+      throw makeOpenAIGatewayError(err);
+    }
+
+    const headers = Object.fromEntries(res.headers.entries());
+    const contentType = (headers['content-type'] || '').toLowerCase();
+    const isStream = contentType.includes('text/event-stream');
+    if (isStream) clearTimeout(abortTimer);
+
+    const readText = async () => {
+      try {
+        return await res.text();
+      } catch (err) {
+        throw makeOpenAIGatewayError(err);
+      } finally {
+        clearTimeout(abortTimer);
+      }
+    };
+
+    return {
+      status: res.status,
+      headers,
+      stream: isStream ? res.body : null,
+      json: isStream ? null : async () => JSON.parse(await readText()),
+      text: isStream ? null : readText,
     };
   }
 
@@ -658,4 +865,11 @@ async function startProxy(opts = {}) {
   return { proxy, ...info };
 }
 
-module.exports = { EvoMapProxy, startProxy, buildAssetSearchQuery, buildSemanticSearchQuery, planAssetSearch };
+module.exports = {
+  EvoMapProxy,
+  startProxy,
+  buildAssetSearchQuery,
+  buildSemanticSearchQuery,
+  planAssetSearch,
+  resolveOpenAIBaseUrl,
+};

@@ -2,6 +2,7 @@
 
 const { PROXY_PROTOCOL_VERSION } = require('../mailbox/store');
 const { AuthError } = require('../lifecycle/manager');
+const { isProxyTraceUploadPayloadAllowed, resolveTraceMode } = require('../trace/extractor');
 const { hubFetch } = require('../../gep/hubFetch');
 
 const MAX_BATCH = 50;
@@ -16,8 +17,31 @@ class OutboundSync {
   }
 
   async flush(channel = 'evomap-hub') {
-    const pending = this.store.pollOutbound({ channel, limit: MAX_BATCH });
-    if (pending.length === 0) return { sent: 0 };
+    const pendingBatch = this.store.pollOutbound({ channel, limit: MAX_BATCH });
+    if (pendingBatch.length === 0) return { sent: 0 };
+
+    let pending = pendingBatch;
+    const rejectedTraceUploads = [];
+    const traceUploadEnabled = resolveTraceMode(process.env, { store: this.store });
+    for (const m of pendingBatch) {
+      if (m.type !== 'proxy_trace') continue;
+      if (!traceUploadEnabled) {
+        rejectedTraceUploads.push({ id: m.id, error: 'proxy trace upload disabled' });
+      } else if (!isProxyTraceUploadPayloadAllowed(m.payload, process.env)) {
+        rejectedTraceUploads.push({ id: m.id, error: 'proxy trace payload rejected' });
+      }
+    }
+    if (rejectedTraceUploads.length > 0) {
+      this.store.updateStatusBatch(rejectedTraceUploads.map(m => ({
+        id: m.id,
+        status: 'rejected',
+        error: m.error,
+      })));
+      const rejectedIds = new Set(rejectedTraceUploads.map(m => m.id));
+      pending = pendingBatch.filter(m => !rejectedIds.has(m.id));
+      if (pending.length === 0) return { sent: 0, dropped: rejectedTraceUploads.length };
+    }
+    const dropped = rejectedTraceUploads.length;
 
     const endpoint = `${this.hubUrl}/a2a/mailbox/outbound`;
 
@@ -83,14 +107,18 @@ class OutboundSync {
       if (inboundMessages.length > 0) this.store.writeInboundBatch(inboundMessages);
 
       this.store.setState('last_sync_at', new Date().toISOString());
-      return { sent: pending.length, synced: updates.length, responses: inboundMessages.length };
+      const result = { sent: pending.length, synced: updates.length, responses: inboundMessages.length };
+      if (dropped > 0) result.dropped = dropped;
+      return result;
     } catch (err) {
       if (err instanceof AuthError) throw err;
       this.logger.error(`[outbound] flush failed: ${err.message}`);
       for (const m of pending) {
         this.store.incrementRetry(m.id, err.message);
       }
-      return { sent: 0, error: err.message };
+      const result = { sent: 0, error: err.message };
+      if (dropped > 0) result.dropped = dropped;
+      return result;
     }
   }
 }

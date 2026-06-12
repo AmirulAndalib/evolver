@@ -146,6 +146,14 @@ how `setup-hooks --platform=codex` wires Evolver in), but it does **not**
 emit a session transcript file the way Cursor / Claude Code / opencode do.
 That means `evolver --review` cannot read raw session logs on Codex.
 
+`setup-hooks --platform=codex` is lifecycle integration only; it does not route
+Codex model requests through Evolver Proxy. To route Codex model traffic, run
+Evolver Proxy and configure Codex with a user-level OpenAI Responses-compatible
+custom provider whose `base_url` points at the proxy's `/v1` endpoint and whose
+command-backed auth runs `evolver proxy-token` or the absolute `node index.js
+proxy-token --settings ...` helper emitted by `scripts/internal-proxy-env.sh
+--codex-config` from a source checkout.
+
 Evolver compensates by reading, in order:
 
 1. `MEMORY.md` / `USER.md` in the workspace root (if you maintain them);

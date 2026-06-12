@@ -8,13 +8,14 @@ const DEFAULT_OUTBOUND_INTERVAL = 5_000;
 const IDLE_THRESHOLD = 5 * 60_000;
 
 class SyncEngine {
-  constructor({ store, hubUrl, getHeaders, logger, onInboundReceived, onAuthError }) {
+  constructor({ store, hubUrl, getHeaders, logger, onInboundReceived, onAuthError, onOutboundFlushed }) {
     this.store = store;
     this.hubUrl = hubUrl;
     this.logger = logger || console;
     this.getHeaders = getHeaders;
     this.onInboundReceived = onInboundReceived || null;
     this.onAuthError = onAuthError || null;
+    this.onOutboundFlushed = onOutboundFlushed || null;
 
     this.outbound = new OutboundSync({ store, hubUrl, getHeaders, logger });
     this.inbound = new InboundSync({ store, hubUrl, getHeaders, logger });
@@ -82,6 +83,11 @@ class SyncEngine {
         try {
           const result = await this.outbound.flush();
           if (result.sent > 0) this._lastActivity = Date.now();
+          if ((result.sent > 0 || result.dropped > 0) && typeof this.onOutboundFlushed === 'function') {
+            try { this.onOutboundFlushed(result); } catch (e) {
+              this.logger.warn?.('[sync] onOutboundFlushed callback failed:', e.message);
+            }
+          }
         } catch (err) {
           if (err instanceof AuthError) {
             await this._handleAuthError('outbound');

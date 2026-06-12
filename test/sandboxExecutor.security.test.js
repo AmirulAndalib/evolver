@@ -124,3 +124,94 @@ test('assertNodeCommandSafe accepts well-formed node invocations', () => {
   assert.doesNotThrow(() => assertNodeCommandSafe({ executable: 'node', args: ['--no-warnings', 'index.js'] }));
   assert.doesNotThrow(() => assertNodeCommandSafe({ executable: 'node', args: ['scripts/validate-suite.js', '--quiet'] }));
 });
+
+// PR #206 (Security Agent): the predictable sandbox base under os.tmpdir()
+// must refuse a pre-existing symlink — on a shared host another local user
+// could pre-create it to redirect every sandbox workdir.
+test('createSandboxDir refuses a symlinked base path', (t) => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const { createSandboxDir } = require('../src/gep/validator/sandboxExecutor');
+
+  const fixtureTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sbx-symlink-'));
+  const realTarget = fs.mkdtempSync(path.join(os.tmpdir(), 'sbx-target-'));
+  const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
+  try {
+    try {
+      fs.symlinkSync(realTarget, path.join(fixtureTmp, 'evolver-validator'));
+    } catch (e) {
+      t.skip('symlinks unavailable: ' + (e && e.code)); // e.g. Windows without privilege
+      return;
+    }
+    process.env.TMPDIR = fixtureTmp; // POSIX
+    process.env.TEMP = fixtureTmp;   // Windows
+    process.env.TMP = fixtureTmp;
+    assert.throws(() => createSandboxDir(), /Refusing sandbox base/);
+  } finally {
+    for (const k of Object.keys(saved)) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    fs.rmSync(fixtureTmp, { recursive: true, force: true });
+    fs.rmSync(realTarget, { recursive: true, force: true });
+  }
+});
+
+test('createSandboxDir still works against a clean base (positive control)', () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const { createSandboxDir, cleanupDir } = require('../src/gep/validator/sandboxExecutor');
+
+  const fixtureTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sbx-clean-'));
+  const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
+  try {
+    process.env.TMPDIR = fixtureTmp;
+    process.env.TEMP = fixtureTmp;
+    process.env.TMP = fixtureTmp;
+    const dir = createSandboxDir();
+    assert.ok(fs.statSync(dir).isDirectory());
+    assert.ok(dir.startsWith(fs.realpathSync(fixtureTmp) + path.sep) || dir.startsWith(fixtureTmp + path.sep));
+    cleanupDir(dir);
+  } finally {
+    for (const k of Object.keys(saved)) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    fs.rmSync(fixtureTmp, { recursive: true, force: true });
+  }
+});
+
+test('createSandboxDir self-heals loose permissions on an owned base', (t) => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const { createSandboxDir, cleanupDir } = require('../src/gep/validator/sandboxExecutor');
+
+  if (process.platform === 'win32') { t.skip('POSIX mode bits only'); return; }
+
+  const fixtureTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sbx-perms-'));
+  const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
+  try {
+    // Pre-create the base as OUR dir but world-writable (e.g. older evolver
+    // or a permissive umask) — must be tightened back to 0700, not refused.
+    const base = path.join(fixtureTmp, 'evolver-validator');
+    fs.mkdirSync(base);
+    fs.chmodSync(base, 0o777);
+    process.env.TMPDIR = fixtureTmp;
+    process.env.TEMP = fixtureTmp;
+    process.env.TMP = fixtureTmp;
+    const dir = createSandboxDir();
+    assert.ok(fs.statSync(dir).isDirectory());
+    assert.strictEqual(fs.statSync(base).mode & 0o077, 0,
+      'a loose owned base must be chmod-ed back to owner-only');
+    cleanupDir(dir);
+  } finally {
+    for (const k of Object.keys(saved)) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    fs.rmSync(fixtureTmp, { recursive: true, force: true });
+  }
+});

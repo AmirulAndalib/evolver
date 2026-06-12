@@ -202,6 +202,26 @@ function reuseAttributionMode() {
   return v === 'shadow' ? 'shadow' : 'off';
 }
 
+// --- Anti-abuse telemetry (privacy-preserving heartbeat summary) ---
+// Enabled by default. In heartbeat mode, clients attach a small
+// `meta.anti_abuse` envelope with low-sensitive hashes, source-confidence
+// labels, and explicit placeholders for data that must be observed by Hub
+// services instead of trusted from the client.
+const ANTI_ABUSE_TELEMETRY_MODE = envStr('EVOLVER_ANTI_ABUSE_TELEMETRY', 'heartbeat');
+function antiAbuseTelemetryMode() {
+  const raw = process.env.EVOLVER_ANTI_ABUSE_TELEMETRY;
+  const v = String(raw == null ? '' : raw).toLowerCase().trim();
+  // Empty / whitespace-only counts as UNSET (same as envStr's '' -> fallback
+  // above): a blank `EVOLVER_ANTI_ABUSE_TELEMETRY=` line in a .env file must
+  // not silently disable the documented default-on behavior. Opt-out is
+  // explicit only.
+  if (v === '') return 'heartbeat';
+  if (v === '0' || v === 'false' || v === 'no' || v === 'off') return 'off';
+  return (v === '1' || v === 'true' || v === 'yes' || v === 'on' || v === 'heartbeat')
+    ? 'heartbeat'
+    : 'off';
+}
+
 // --- Validator mode (opt-out) ---
 // Node role: the evolver periodically fetches assigned validation tasks from
 // the Hub, runs the commands in an isolated sandbox, and submits
@@ -286,6 +306,9 @@ module.exports = {
   // Reuse attribution (P4-a Slice A)
   REUSE_ATTRIBUTION_MODE,
   reuseAttributionMode,
+  // Anti-abuse telemetry
+  ANTI_ABUSE_TELEMETRY_MODE,
+  antiAbuseTelemetryMode,
   // Validator (opt-in role)
   VALIDATOR_ENABLED,
   VALIDATOR_STAKE_AMOUNT,

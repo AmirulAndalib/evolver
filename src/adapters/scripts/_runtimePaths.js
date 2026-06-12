@@ -415,6 +415,7 @@ function isGitWorkspace(dir) {
       timeout: 5000,
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
+      windowsHide: true,
     });
     return res.status === 0 && typeof res.stdout === 'string' && res.stdout.trim() === 'true';
   } catch {

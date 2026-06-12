@@ -83,6 +83,7 @@ function _maybeRestartDaemon(evolverRoot) {
         stdio: 'ignore',
         cwd: evolverRoot,
         env: Object.assign({}, process.env),
+        windowsHide: true,
       }
     );
     child.unref();

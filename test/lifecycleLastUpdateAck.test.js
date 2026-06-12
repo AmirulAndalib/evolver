@@ -82,6 +82,66 @@ function responseFromJson({ status = 200, json = {}, headers = {} } = {}) {
   };
 }
 
+test('lifecycle heartbeat attaches default anti_abuse telemetry without leaking salt', async () => {
+  const originalFetch = global.fetch;
+  const originalMode = process.env.EVOLVER_ANTI_ABUSE_TELEMETRY;
+  const originalSalt = process.env.EVOLVER_ANTI_ABUSE_SALT;
+  try {
+    delete process.env.EVOLVER_ANTI_ABUSE_TELEMETRY;
+    process.env.EVOLVER_ANTI_ABUSE_SALT = 'lifecycle-test-salt';
+    const mf = mockFetch(() => responseFromJson({ status: 200, json: { status: 'ok' } }));
+    global.fetch = mf;
+
+    const mgr = new LifecycleManager({
+      hubUrl: 'https://example.test',
+      store: makeStore(),
+      logger: silentLogger(),
+    });
+    const result = await mgr.heartbeat();
+
+    assert.strictEqual(result.ok, true);
+    const body = JSON.parse(mf.calls[0].opts.body);
+    assert.strictEqual(body.meta.anti_abuse.schema_version, 'anti_abuse.v1');
+    assert.strictEqual(body.meta.anti_abuse.source, 'evolver-proxy');
+    // The proxy's own heartbeat reports ground truth, not env sniffing —
+    // this process typically has neither EVOMAP_PROXY nor EVOMAP_PROXY_PORT.
+    assert.strictEqual(body.meta.anti_abuse.local_security_boundary.proxy_port_configured, true);
+    assert.strictEqual(body.meta.anti_abuse.source_confidence.network_source, 'server_observed_required');
+    assert.strictEqual(JSON.stringify(body).includes('lifecycle-test-salt'), false);
+  } finally {
+    global.fetch = originalFetch;
+    if (originalMode === undefined) delete process.env.EVOLVER_ANTI_ABUSE_TELEMETRY;
+    else process.env.EVOLVER_ANTI_ABUSE_TELEMETRY = originalMode;
+    if (originalSalt === undefined) delete process.env.EVOLVER_ANTI_ABUSE_SALT;
+    else process.env.EVOLVER_ANTI_ABUSE_SALT = originalSalt;
+  }
+});
+
+test('lifecycle heartbeat omits anti_abuse telemetry when disabled', async () => {
+  const originalFetch = global.fetch;
+  const originalMode = process.env.EVOLVER_ANTI_ABUSE_TELEMETRY;
+  try {
+    process.env.EVOLVER_ANTI_ABUSE_TELEMETRY = 'off';
+    const mf = mockFetch(() => responseFromJson({ status: 200, json: { status: 'ok' } }));
+    global.fetch = mf;
+
+    const mgr = new LifecycleManager({
+      hubUrl: 'https://example.test',
+      store: makeStore(),
+      logger: silentLogger(),
+    });
+    const result = await mgr.heartbeat();
+
+    assert.strictEqual(result.ok, true);
+    const body = JSON.parse(mf.calls[0].opts.body);
+    assert.strictEqual(body.meta.anti_abuse, undefined);
+  } finally {
+    global.fetch = originalFetch;
+    if (originalMode === undefined) delete process.env.EVOLVER_ANTI_ABUSE_TELEMETRY;
+    else process.env.EVOLVER_ANTI_ABUSE_TELEMETRY = originalMode;
+  }
+});
+
 function seedLastUpdate() {
   _resetLastUpdateStateForTesting();
   _persistLastUpdateStateForTesting({

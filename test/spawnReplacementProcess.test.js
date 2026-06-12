@@ -11,8 +11,37 @@ const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
+const vm = require('node:vm');
 
-const { spawnReplacementProcess } = require('..');
+// Keep this VM slice instead of require('..'): loading the full daemon entrypoint
+// would run top-level bootstrapping and can start long-lived proxy/evolver side
+// effects before these helper-only assertions execute.
+function loadSpawnReplacementProcess() {
+  const indexPath = path.resolve(__dirname, '..', 'index.js');
+  const source = fs.readFileSync(indexPath, 'utf8');
+  const start = source.indexOf('function parseBoolEnv(');
+  const end = source.indexOf('\n// Atomic write of the cycle_progress.json file', start);
+  assert.ok(start > 0, 'expected parseBoolEnv declaration');
+  assert.ok(end > start, 'expected spawnReplacementProcess helper block');
+  const script = [
+    'const fs = require("fs");',
+    'const { spawn } = require("child_process");',
+    source.slice(start, end),
+    'module.exports = { spawnReplacementProcess };',
+  ].join('\n');
+  const context = {
+    module: { exports: {} },
+    exports: {},
+    require,
+    process,
+    console,
+    __filename: indexPath,
+  };
+  vm.runInNewContext(script, context, { filename: indexPath });
+  return context.module.exports.spawnReplacementProcess;
+}
+
+const spawnReplacementProcess = loadSpawnReplacementProcess();
 
 // Helper: temporarily override process.platform without leaking state.
 function withPlatform(value, fn) {
@@ -163,5 +192,50 @@ describe('index.js source-level guards (Issue #528 regression)', () => {
   it('helper documents EVOLVER_SUICIDE_WINDOWS escape hatch', () => {
     assert.match(source, /EVOLVER_SUICIDE_WINDOWS/,
       'env var name must be referenced in source for discoverability');
+  });
+});
+
+describe('Windows no-console process launch guards', () => {
+  it('idle scheduler runs PowerShell without shelling through a visible console host', () => {
+    const source = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'gep', 'idleScheduler.js'), 'utf8');
+    assert.doesNotMatch(source, /execSync\('powershell\b/,
+      'Windows idle detection must not use execSync("powershell ..."), which shells through cmd.exe');
+    assert.match(source, /execFileSync\('powershell',\s*\[[\s\S]*?windowsHide:\s*true/,
+      'Windows idle detection must use execFileSync(..., windowsHide: true)');
+  });
+
+  it('ops lifecycle hides Windows process scans, daemon start, and taskkill', () => {
+    const source = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'ops', 'lifecycle.js'), 'utf8');
+    assert.doesNotMatch(source, /execText\('powershell\b/,
+      'Windows process scans must not shell through cmd.exe');
+    assert.match(source, /function execFileText\(file, args\)[\s\S]*?execFileSync\(file, args,[\s\S]*?windowsHide:\s*true/,
+      'Windows process scans must use execFileSync(..., windowsHide: true)');
+    assert.match(source, /spawn\(process\.execPath,\s*\[script, '--loop'\],[\s\S]*?windowsHide:\s*true/,
+      'detached lifecycle start must hide any Windows child window');
+    assert.match(source, /execFileSync\('taskkill',\s*\['\/F', '\/PID', String\(remaining\[j\]\)\],[\s\S]*?windowsHide:\s*true/,
+      'Windows taskkill fallback must hide the child window');
+  });
+
+  it('session-start auto-restart does not spawn a visible Windows child', () => {
+    const source = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'adapters', 'scripts', 'evolver-session-start.js'), 'utf8');
+    assert.match(source, /spawn\(\s*process\.execPath,\s*\[lifecyclePath, 'start'\],[\s\S]*?windowsHide:\s*true/,
+      'session-start daemon auto-restart must pass windowsHide: true');
+  });
+
+  it('adapter git probes hide child windows on Windows', () => {
+    const sessionEnd = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'adapters', 'scripts', 'evolver-session-end.js'), 'utf8');
+    const runtimePaths = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'adapters', 'scripts', '_runtimePaths.js'), 'utf8');
+    assert.match(sessionEnd, /spawnSync\('git', args,[\s\S]*?shell:\s*false,[\s\S]*?windowsHide:\s*true/);
+    assert.match(runtimePaths, /spawnSync\('git', \['rev-parse', '--is-inside-work-tree'\],[\s\S]*?shell:\s*false,[\s\S]*?windowsHide:\s*true/);
+  });
+
+  it('daemon loop git probes hide child windows on Windows', () => {
+    const indexSource = fs.readFileSync(path.resolve(__dirname, '..', 'index.js'), 'utf8');
+    const guardsSource = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'evolve', 'guards.js'), 'utf8');
+    assert.match(indexSource, /execSync\('git --version'[\s\S]*?windowsHide:\s*true/);
+    assert.match(indexSource, /execSync\('git diff'[\s\S]*?windowsHide:\s*true/);
+    assert.match(indexSource, /execSync\('git ls-files --others --exclude-standard'[\s\S]*?windowsHide:\s*true/);
+    assert.match(guardsSource, /git log -1 --pretty=format:%ct%n%s'[\s\S]*?windowsHide:\s*true/);
+    assert.match(guardsSource, /execSync\('git rev-parse --git-dir'[\s\S]*?windowsHide:\s*true/);
   });
 });

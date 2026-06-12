@@ -3,7 +3,14 @@
 const { PROXY_PROTOCOL_VERSION, SCHEMA_VERSION } = require('../mailbox/store');
 
 function buildRoutes(store, proxyHandlers, taskMonitor, extensions) {
-  const { dmHandler, skillUpdater, getHubMailboxStatus, sessionHandler, messagesHandler } = extensions || {};
+  const {
+    dmHandler,
+    skillUpdater,
+    getHubMailboxStatus,
+    sessionHandler,
+    messagesHandler,
+    responsesHandler,
+  } = extensions || {};
   const routes = {
     // -- Mailbox --
     'POST /mailbox/send': async ({ body }) => {
@@ -465,6 +472,9 @@ function buildRoutes(store, proxyHandlers, taskMonitor, extensions) {
   // EVOMAP_ROUTER_ENABLED behavior inside the handler.
   if (messagesHandler) {
     routes['POST /v1/messages'] = messagesHandler;
+  }
+  if (responsesHandler) {
+    routes['POST /v1/responses'] = responsesHandler;
   }
 
   return routes;

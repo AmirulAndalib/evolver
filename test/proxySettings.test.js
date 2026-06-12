@@ -2,6 +2,7 @@
 
 const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert/strict');
+const { execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -77,5 +78,71 @@ describe('settings', () => {
     writeSettings({ _test: true });
     const mode = fs.statSync(file).mode & 0o777;
     assert.equal(mode, 0o600, 'writeSettings must tighten 0o644 to 0o600');
+  });
+
+  it('proxy-token command prints only the local proxy token', () => {
+    writeSettings({ proxy: { url: 'http://127.0.0.1:19820', token: 'proxy-token-test', pid: process.pid } });
+    const out = execFileSync(process.execPath, [path.join(__dirname, '..', 'index.js'), 'proxy-token'], {
+      encoding: 'utf8',
+      env: { ...process.env, EVOLVER_SETTINGS_DIR: tmpDir },
+    });
+    assert.equal(out, 'proxy-token-test\n');
+  });
+
+  it('proxy-token command can read an explicit settings file', () => {
+    const explicitDir = fs.mkdtempSync(path.join(tmpDir, 'explicit-'));
+    const explicitSettings = path.join(explicitDir, 'settings.json');
+    fs.writeFileSync(explicitSettings, JSON.stringify({
+      proxy: { url: 'http://127.0.0.1:19999', token: 'explicit-token-test', pid: process.pid },
+    }));
+    const out = execFileSync(process.execPath, [
+      path.join(__dirname, '..', 'index.js'),
+      'proxy-token',
+      '--settings',
+      explicitSettings,
+    ], {
+      encoding: 'utf8',
+      env: { ...process.env, EVOLVER_SETTINGS_DIR: tmpDir },
+    });
+    assert.equal(out, 'explicit-token-test\n');
+  });
+
+  it('proxy-token help and argument errors do not print the token', () => {
+    writeSettings({ proxy: { url: 'http://127.0.0.1:19820', token: 'proxy-token-secret', pid: process.pid } });
+    const bin = process.execPath;
+    const cli = path.join(__dirname, '..', 'index.js');
+    const env = { ...process.env, EVOLVER_SETTINGS_DIR: tmpDir };
+
+    const help = spawnSync(bin, [cli, 'proxy-token', '--help'], { encoding: 'utf8', env });
+    assert.equal(help.status, 0);
+    assert.match(help.stdout, /proxy-token \[--settings FILE\]/);
+    assert.ok(!help.stdout.includes('proxy-token-secret'));
+    assert.ok(!help.stderr.includes('proxy-token-secret'));
+
+    const unknown = spawnSync(bin, [cli, 'proxy-token', '--bad-flag'], { encoding: 'utf8', env });
+    assert.equal(unknown.status, 2);
+    assert.match(unknown.stderr, /unknown argument/);
+    assert.ok(!unknown.stdout.includes('proxy-token-secret'));
+    assert.ok(!unknown.stderr.includes('proxy-token-secret'));
+
+    const missing = spawnSync(bin, [cli, 'proxy-token', '--settings'], { encoding: 'utf8', env });
+    assert.equal(missing.status, 2);
+    assert.match(missing.stderr, /missing value/);
+    assert.ok(!missing.stdout.includes('proxy-token-secret'));
+    assert.ok(!missing.stderr.includes('proxy-token-secret'));
+  });
+
+  it('internal-proxy-env prints Codex config without embedding the token', () => {
+    writeSettings({ proxy: { url: 'http://127.0.0.1:19820', token: 'proxy-token-secret', pid: process.pid } });
+    const script = path.join(__dirname, '..', 'scripts', 'internal-proxy-env.sh');
+    const out = execFileSync('bash', [script, '--settings', getSettingsFile(), '--codex-config'], {
+      encoding: 'utf8',
+    });
+    assert.match(out, /base_url = "http:\/\/127\.0\.0\.1:19820\/v1"/);
+    assert.match(out, new RegExp(`command = ${JSON.stringify(process.execPath).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.match(out, /"proxy-token"/);
+    assert.match(out, /"--settings"/);
+    assert.match(out, new RegExp(JSON.stringify(getSettingsFile()).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.ok(!out.includes('proxy-token-secret'), 'config snippet must not contain the bearer token');
   });
 });

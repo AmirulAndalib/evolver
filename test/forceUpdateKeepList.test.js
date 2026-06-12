@@ -1,4 +1,4 @@
-const { describe, it, before, after } = require('node:test');
+const { describe, it, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
@@ -24,9 +24,11 @@ function freshRequireForceUpdate(execFileStub) {
     exports: { getEvolverInstallRoot: () => installRoot },
   };
   childProcess.execFileSync = execFileStub;
-  const mod = require('../src/forceUpdate');
-  childProcess.execFileSync = origExecFileSync;
-  return mod;
+  try {
+    return require('../src/forceUpdate');
+  } finally {
+    childProcess.execFileSync = origExecFileSync;
+  }
 }
 
 // Fake degit: write a new-version package.json + index.js into TMP_TARGET.
@@ -41,6 +43,26 @@ function makeSuccessfulDegit(version) {
       'utf8',
     );
     fs.writeFileSync(path.join(tmpTarget, 'index.js'), '// v' + version, 'utf8');
+  };
+}
+
+function makeDegitWithLocalStateFiles(version) {
+  return function (_bin, args) {
+    const tmpTarget = args[args.length - 1];
+    fs.mkdirSync(tmpTarget, { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpTarget, 'package.json'),
+      JSON.stringify({ name: '@evomap/evolver', version }),
+      'utf8',
+    );
+    fs.writeFileSync(path.join(tmpTarget, 'index.js'), '// v' + version, 'utf8');
+    fs.writeFileSync(path.join(tmpTarget, '.env'), 'A2A_NODE_SECRET=from-release\n', 'utf8');
+    fs.writeFileSync(path.join(tmpTarget, '.env.local'), 'DEBUG=from-release\n', 'utf8');
+    fs.writeFileSync(path.join(tmpTarget, 'USER.md'), '# release user notes\n', 'utf8');
+    fs.mkdirSync(path.join(tmpTarget, '.evolver'), { recursive: true });
+    fs.writeFileSync(path.join(tmpTarget, '.evolver', 'config.json'), '{"workspaceId":"release"}', 'utf8');
+    fs.mkdirSync(path.join(tmpTarget, 'memory'), { recursive: true });
+    fs.writeFileSync(path.join(tmpTarget, 'memory', 'state.json'), '{"from":"release"}', 'utf8');
   };
 }
 
@@ -78,6 +100,12 @@ describe('executeForceUpdate: keep-list preserves user config files', () => {
     delete require.cache[pathsModPath];
     delete require.cache[forceUpdateModPath];
     try { fs.rmSync(installRoot, { recursive: true, force: true }); } catch (_) {}
+  });
+
+  beforeEach(() => {
+    childProcess.execFileSync = origExecFileSync;
+    try { fs.rmSync(installRoot, { recursive: true, force: true }); } catch (_) {}
+    fs.mkdirSync(installRoot, { recursive: true });
   });
 
   it('preserves .env, .env.local, USER.md, .evolver/ and replaces old code files', () => {
@@ -144,5 +172,27 @@ describe('executeForceUpdate: keep-list preserves user config files', () => {
       '.env must survive a failed update');
     assert.ok(fs.existsSync(path.join(installRoot, 'index.js')),
       'old index.js must survive a failed update (no replacement happened)');
+  });
+
+  it('does NOT overwrite keep-list state even if the release archive contains those paths', () => {
+    populateFakeInstall(installRoot);
+    fs.writeFileSync(path.join(installRoot, 'memory', 'state.json'), '{"from":"local"}', 'utf8');
+
+    const { executeForceUpdate } = freshRequireForceUpdate(makeDegitWithLocalStateFiles('2.0.0'));
+    const result = executeForceUpdate({ required_version: '2.0.0' });
+
+    assert.equal(result, true, 'update should succeed');
+    assert.equal(
+      fs.readFileSync(path.join(installRoot, '.env'), 'utf8'),
+      'A2A_HUB_URL=https://hub.example.com\nA2A_NODE_SECRET=s3cr3t\n',
+      '.env must remain local, not release-provided',
+    );
+    assert.equal(fs.readFileSync(path.join(installRoot, '.env.local'), 'utf8'), 'DEBUG=1\n');
+    assert.equal(fs.readFileSync(path.join(installRoot, 'USER.md'), 'utf8'), '# my notes\n');
+    assert.equal(
+      fs.readFileSync(path.join(installRoot, '.evolver', 'config.json'), 'utf8'),
+      '{"workspaceId":"wid_test"}',
+    );
+    assert.equal(fs.readFileSync(path.join(installRoot, 'memory', 'state.json'), 'utf8'), '{"from":"local"}');
   });
 });

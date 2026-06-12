@@ -64,12 +64,21 @@ function parseBody(req, opts) {
   });
 }
 
-function sendJson(res, status, body) {
+function sendJson(res, status, body, extraHeaders = {}) {
   const payload = JSON.stringify(body);
-  res.writeHead(status, {
+  const headers = {
     'Content-Type': 'application/json',
     'Content-Length': Buffer.byteLength(payload),
-  });
+  };
+  for (const [name, value] of Object.entries(extraHeaders || {})) {
+    if (value === undefined || value === null) continue;
+    const lower = String(name).toLowerCase();
+    if (lower === 'content-length' || lower === 'transfer-encoding' || lower === 'connection') continue;
+    const headerValue = Array.isArray(value) ? value.join(', ') : String(value);
+    if (/[\r\n]/.test(headerValue)) continue;
+    headers[name] = headerValue;
+  }
+  res.writeHead(status, headers);
   res.end(payload);
 }
 
@@ -196,7 +205,7 @@ class ProxyHttpServer {
       if (result && result.stream) {
         await this._streamResponse(res, result);
       } else {
-        sendJson(res, result.status || 200, result.body || result);
+        sendJson(res, result.status || 200, result.body || result, result.headers);
       }
     } catch (err) {
       this.logger.error(`[proxy] ${routeKey} error:`, err.message);

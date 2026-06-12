@@ -239,7 +239,12 @@ function _getSystemIdleSecondsUncached() {
       ].join('\n');
       const tmpPs = path.join(require('os').tmpdir(), 'evolver_idle_check.ps1');
       require('fs').writeFileSync(tmpPs, psCode, 'utf8');
-      const result = execSync('powershell -NoProfile -ExecutionPolicy Bypass -File "' + tmpPs + '"', { timeout: 10000, encoding: 'utf8', maxBuffer: MAX_EXEC_BUFFER }).trim();
+      const result = execFileSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', tmpPs], {
+        timeout: 10000,
+        encoding: 'utf8',
+        maxBuffer: MAX_EXEC_BUFFER,
+        windowsHide: true,
+      }).trim();
       try { require('fs').unlinkSync(tmpPs); } catch (e) {}
       const seconds = parseInt(result, 10);
       return Number.isFinite(seconds) ? seconds : -1;

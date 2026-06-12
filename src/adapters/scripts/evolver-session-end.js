@@ -38,6 +38,7 @@ function runGit(args, cwd) {
     maxBuffer: MAX_EXEC_BUFFER,
     stdio: ['ignore', 'pipe', 'pipe'],
     shell: false,
+    windowsHide: true,
   });
   if (res.status === 0 && typeof res.stdout === 'string') {
     return { ok: true, out: res.stdout.trim() };

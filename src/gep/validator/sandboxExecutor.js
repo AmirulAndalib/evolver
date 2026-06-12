@@ -138,8 +138,36 @@ function createSandboxDir() {
   // directory is NOT access-restricted on Windows; rely on OS user isolation
   // instead. This cannot be fully mitigated via fs.mkdirSync options alone.
   const base = path.join(os.tmpdir(), 'evolver-validator');
-  if (!fs.existsSync(base)) {
+  // The base path is predictable, so on a shared host another local user
+  // could pre-create it as a symlink and redirect every sandbox workdir
+  // outside the intended boundary. mkdir first (EEXIST is fine), then lstat
+  // and refuse anything that is not a real directory — the sticky bit on
+  // /tmp prevents others from replacing our directory after this check.
+  try {
     fs.mkdirSync(base, { recursive: true, mode: 0o700 });
+  } catch (e) {
+    if (!e || e.code !== 'EEXIST') {
+      throw new Error('[sandboxExecutor] Failed to create sandbox base ' + base + ': ' + (e && e.message || e));
+    }
+  }
+  const baseSt = fs.lstatSync(base);
+  if (baseSt.isSymbolicLink() || !baseSt.isDirectory()) {
+    throw new Error('[sandboxExecutor] Refusing sandbox base ' + base + ': exists and is ' +
+      (baseSt.isSymbolicLink() ? 'a symlink' : 'not a directory'));
+  }
+  // A real directory is still not enough: a pre-existing base OWNED BY
+  // ANOTHER USER lets that user rename/replace our task workdirs at will
+  // (deletion rights come from the parent dir). Require ownership, and
+  // self-heal loose permissions on a base we do own (chmod is safe then).
+  // POSIX-only: Windows has no getuid and ignores these mode bits anyway.
+  if (typeof process.getuid === 'function') {
+    if (baseSt.uid !== process.getuid()) {
+      throw new Error('[sandboxExecutor] Refusing sandbox base ' + base + ': owned by uid ' +
+        baseSt.uid + ', not the current user (' + process.getuid() + ')');
+    }
+    if ((baseSt.mode & 0o077) !== 0) {
+      fs.chmodSync(base, 0o700);
+    }
   }
   const name = 'task_' + Date.now().toString(36) + '_' + crypto.randomBytes(4).toString('hex');
   const dir = path.join(base, name);

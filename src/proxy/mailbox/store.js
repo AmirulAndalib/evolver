@@ -7,6 +7,24 @@ const crypto = require('crypto');
 const DEFAULT_CHANNEL = 'evomap-hub';
 const SCHEMA_VERSION = 1;
 const PROXY_PROTOCOL_VERSION = '0.1.0';
+const PRIVATE_DIR_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
+
+function bestEffortChmod(filePath, mode) {
+  try { fs.chmodSync(filePath, mode); } catch { /* best effort; no-op on Windows */ }
+}
+
+function ensurePrivateDir(dir) {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true, mode: PRIVATE_DIR_MODE });
+  }
+  bestEffortChmod(dir, PRIVATE_DIR_MODE);
+}
+
+function writePrivateFile(filePath, content) {
+  fs.writeFileSync(filePath, content, { encoding: 'utf8', mode: PRIVATE_FILE_MODE });
+  bestEffortChmod(filePath, PRIVATE_FILE_MODE);
+}
 
 // Merge `fields` into `target` while stripping keys that can mutate the
 // prototype chain. Mailbox rows are persisted as JSONL and rebuilt on
@@ -90,8 +108,8 @@ function safeParse(payload) {
 // regular files that POSIX local filesystems do, so the removal above is
 // equally valid on Windows. No platform-specific code is needed here.
 function appendLine(filePath, obj) {
-  fs.appendFileSync(filePath, JSON.stringify(obj) + '\n', 'utf8');
-  try { fs.chmodSync(filePath, 0o600); } catch { /* best effort */ }
+  fs.appendFileSync(filePath, JSON.stringify(obj) + '\n', { encoding: 'utf8', mode: PRIVATE_FILE_MODE });
+  bestEffortChmod(filePath, PRIVATE_FILE_MODE);
 }
 
 function readLines(filePath) {
@@ -112,11 +130,13 @@ function readLines(filePath) {
 class MailboxStore {
   constructor(dataDir) {
     if (!dataDir) throw new Error('dataDir is required');
-    if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+    ensurePrivateDir(dataDir);
     this.dataDir = dataDir;
 
     this._messagesFile = path.join(dataDir, 'messages.jsonl');
     this._stateFile = path.join(dataDir, 'state.json');
+    bestEffortChmod(this._messagesFile, PRIVATE_FILE_MODE);
+    bestEffortChmod(this._stateFile, PRIVATE_FILE_MODE);
 
     // in-memory indexes
     this._messages = new Map();          // id -> message object
@@ -156,7 +176,7 @@ class MailboxStore {
 
   _persistState() {
     const dir = path.dirname(this._stateFile);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    ensurePrivateDir(dir);
     // Round-7 (§20.5): per-PID tmp path. Two evolver processes (daemon +
     // ad-hoc CLI / proxy + loop) writing to the same `${stateFile}.tmp`
     // would otherwise interleave: process B's writeFileSync truncates
@@ -167,7 +187,7 @@ class MailboxStore {
     // for 30 min..4 h" symptom this branch targets. Matches the
     // precedent set by _persistNodeSecret in src/gep/a2aProtocol.js.
     const tmp = `${this._stateFile}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(this._state, null, 2) + '\n', 'utf8');
+    writePrivateFile(tmp, JSON.stringify(this._state, null, 2) + '\n');
     // Windows: fs.renameSync throws EPERM when the destination file already
     // exists, unlike POSIX where rename(2) atomically replaces the target.
     // Remove the destination first so the rename succeeds on all platforms.
@@ -179,6 +199,7 @@ class MailboxStore {
       }
     }
     fs.renameSync(tmp, this._stateFile);
+    bestEffortChmod(this._stateFile, PRIVATE_FILE_MODE);
   }
 
   _rebuildIndex() {
@@ -387,7 +408,7 @@ class MailboxStore {
     return all.slice(skip, skip + max).map(m => ({ ...m }));
   }
 
-  countPending({ direction, channel } = {}) {
+  countPending({ direction, channel, type } = {}) {
     const dir = direction || 'outbound';
     let count = 0;
     const idList = dir === 'outbound' ? this._outbound : this._inbound;
@@ -395,6 +416,7 @@ class MailboxStore {
       const msg = this._messages.get(id);
       if (!msg || msg.status !== 'pending') continue;
       if (channel && msg.channel !== channel) continue;
+      if (type && msg.type !== type) continue;
       count++;
     }
     return count;
@@ -435,11 +457,12 @@ class MailboxStore {
     }
     entries.sort((a, b) => a.created_at - b.created_at);
 
-    const fd = fs.openSync(tmpFile, 'w');
+    const fd = fs.openSync(tmpFile, 'w', PRIVATE_FILE_MODE);
     for (const msg of entries) {
       fs.writeSync(fd, JSON.stringify(msg) + '\n');
     }
     fs.closeSync(fd);
+    bestEffortChmod(tmpFile, PRIVATE_FILE_MODE);
     // Windows: renameSync throws EPERM when the destination already exists.
     // Remove it first so the swap succeeds on all platforms.
     if (process.platform === 'win32') {
@@ -448,6 +471,7 @@ class MailboxStore {
       }
     }
     fs.renameSync(tmpFile, this._messagesFile);
+    bestEffortChmod(this._messagesFile, PRIVATE_FILE_MODE);
     this._rebuildIndex();
   }
 

@@ -58,6 +58,7 @@ const FORCE_UPDATE_FAIL_CODES = Object.freeze({
   DEGIT_FAILED: 'degit_failed',
   DOWNLOAD_INCOMPLETE: 'download_incomplete',
   DOWNLOADED_VERSION_MISMATCH: 'downloaded_version_mismatch',
+  DELETE_FAILED: 'delete_failed',
   COPY_FAILED: 'copy_failed',
   ALL_CHANNELS_EXHAUSTED: 'all_channels_exhausted',
 });
@@ -92,6 +93,10 @@ function _errStr(e) {
 //   'parse' -> degit exited 0 but the downloaded package.json is missing/invalid
 //   'copy'  -> the staged tree downloaded fine but cpSync into INSTALL_ROOT failed
 function _classifyChannel1Error(e, phase) {
+  if (phase === 'delete') {
+    var deleteEntry = e && e._evolverEntry ? String(e._evolverEntry) + ': ' : '';
+    return _fail(FORCE_UPDATE_FAIL_CODES.DELETE_FAILED, deleteEntry + _errStr(e));
+  }
   if (phase === 'copy') {
     var entry = e && e._evolverEntry ? String(e._evolverEntry) + ': ' : '';
     return _fail(FORCE_UPDATE_FAIL_CODES.COPY_FAILED, entry + _errStr(e));
@@ -132,6 +137,72 @@ function _classifyChannel1Error(e, phase) {
   }
   if (stderr) detail += ' | stderr=' + stderr.slice(-300);
   return _fail(FORCE_UPDATE_FAIL_CODES.DEGIT_FAILED, detail);
+}
+
+function _isRetryableFsLockError(e) {
+  var code = e && e.code;
+  return code === 'EPERM' || code === 'EBUSY' || code === 'EACCES' ||
+    code === 'ENOTEMPTY' || code === 'EMFILE' || code === 'ENFILE';
+}
+
+function _waitForFsLockRetry() {
+  var until = Date.now() + 200;
+  while (Date.now() < until) { /* spin */ }
+}
+
+function _retryFsLockOperation(fn) {
+  var err = null;
+  for (var attempt = 0; attempt < 3; attempt++) {
+    try {
+      return fn();
+    } catch (e) {
+      err = e;
+      if (!_isRetryableFsLockError(e)) break;
+      if (attempt < 2) _waitForFsLockRetry();
+    }
+  }
+  throw err;
+}
+
+function _recoverPackageCommitMarkerIfMissing(installRoot) {
+  var pkgDst = path.join(installRoot, 'package.json');
+  if (fs.existsSync(pkgDst)) return false;
+  var entries;
+  try {
+    entries = fs.readdirSync(installRoot);
+  } catch (_) {
+    return false;
+  }
+  var backups = entries
+    .filter(function (name) { return /^package\.json\.\d+\.evolver-old$/.test(name); })
+    .sort();
+  for (var i = backups.length - 1; i >= 0; i--) {
+    try {
+      fs.renameSync(path.join(installRoot, backups[i]), pkgDst);
+      console.warn('[ForceUpdate] Recovered package.json commit marker from ' + backups[i]);
+      return true;
+    } catch (_) {}
+  }
+  return false;
+}
+
+function _restorePackageBackup(pkgBackup, pkgDst) {
+  if (!fs.existsSync(pkgBackup)) return false;
+  if (fs.existsSync(pkgDst)) {
+    try { fs.rmSync(pkgBackup, { force: true }); } catch (_) {}
+    return false;
+  }
+  try {
+    fs.renameSync(pkgBackup, pkgDst);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function _isForceUpdateKeepEntry(name) {
+  return name === 'node_modules' || name === 'memory' || name === '.git' || name === 'MEMORY.md' ||
+    name === '.env' || name === '.env.local' || name === 'USER.md' || name === '.evolver';
 }
 
 // Module-level mutex: shared by every caller that requires('../forceUpdate'),
@@ -263,10 +334,29 @@ function _executeForceUpdateInner(forceUpdate) {
         'install root package.json name="' + (pkg && pkg.name) + '", expected "@evomap/evolver"');
     }
   } catch (e) {
-    console.warn('[ForceUpdate] Refusing — cannot read ' + INSTALL_ROOT +
-      '/package.json: ' + (e && e.message || e));
-    return _fail(FORCE_UPDATE_FAIL_CODES.INSTALL_GUARD_UNREADABLE,
-      'cannot read install root package.json: ' + _errStr(e));
+    if (_recoverPackageCommitMarkerIfMissing(INSTALL_ROOT)) {
+      try {
+        const recoveredPkg = JSON.parse(fs.readFileSync(path.join(INSTALL_ROOT, 'package.json'), 'utf8'));
+        if (!recoveredPkg || (recoveredPkg.name !== '@evomap/evolver' && recoveredPkg.name !== 'evolver')) {
+          console.warn('[ForceUpdate] Refusing — recovered ' + INSTALL_ROOT +
+            '/package.json has name="' + (recoveredPkg && recoveredPkg.name) +
+            '", expected "@evomap/evolver". Aborting to avoid data loss.');
+          return _fail(FORCE_UPDATE_FAIL_CODES.INSTALL_GUARD_NAME_MISMATCH,
+            'recovered install root package.json name="' + (recoveredPkg && recoveredPkg.name) +
+            '", expected "@evomap/evolver"');
+        }
+      } catch (recoverReadErr) {
+        console.warn('[ForceUpdate] Refusing — cannot read recovered ' + INSTALL_ROOT +
+          '/package.json: ' + (recoverReadErr && recoverReadErr.message || recoverReadErr));
+        return _fail(FORCE_UPDATE_FAIL_CODES.INSTALL_GUARD_UNREADABLE,
+          'cannot read recovered install root package.json: ' + _errStr(recoverReadErr));
+      }
+    } else {
+      console.warn('[ForceUpdate] Refusing — cannot read ' + INSTALL_ROOT +
+        '/package.json: ' + (e && e.message || e));
+      return _fail(FORCE_UPDATE_FAIL_CODES.INSTALL_GUARD_UNREADABLE,
+        'cannot read install root package.json: ' + _errStr(e));
+    }
   }
 
   const requiredVersion = normalizeRequiredVersion(forceUpdate.required_version);
@@ -335,7 +425,7 @@ function _executeForceUpdateInner(forceUpdate) {
   // terminal `return` can surface it instead of a bare `false`. `phase` tracks
   // how far we got before any throw, so _classifyChannel1Error can tell a
   // degit-spawn failure (phase 'degit') from a truncated download (phase
-  // 'parse') from a copy-into-INSTALL_ROOT failure (phase 'copy').
+  // 'parse') from a delete/copy-into-INSTALL_ROOT failure.
   var channel1Failure = null;
   var phase = 'degit';
   try {
@@ -353,7 +443,6 @@ function _executeForceUpdateInner(forceUpdate) {
     // Require exact version match — a ">=" check would allow a compromised hub to
     // request version "0.0.1" and install any version including unreleased HEAD code.
     if (tmpPkg.version && tmpPkg.version === requiredVersion) {
-      phase = 'copy';
       var entries = fs.readdirSync(INSTALL_ROOT, { withFileTypes: true });
       for (var ei = 0; ei < entries.length; ei++) {
         var eName = entries[ei].name;
@@ -366,37 +455,38 @@ function _executeForceUpdateInner(forceUpdate) {
         // refuses on an unreadable package.json, wedging the node in
         // install_guard_unreadable on every subsequent attempt with no path
         // that ever re-copies it. Deferring it keeps the install self-healing.
-        if (eName === 'node_modules' || eName === 'memory' || eName === '.git' || eName === 'MEMORY.md'
-            || eName === '.env' || eName === '.env.local' || eName === 'USER.md' || eName === '.evolver'
-            || eName === 'package.json') continue;
-        try { fs.rmSync(path.join(INSTALL_ROOT, eName), { recursive: true, force: true }); } catch (_) {}
+        if (_isForceUpdateKeepEntry(eName) || eName === 'package.json') continue;
+        try {
+          (function (entryName) {
+            phase = 'delete';
+            _retryFsLockOperation(function () {
+              fs.rmSync(path.join(INSTALL_ROOT, entryName), {
+                recursive: true, force: true, maxRetries: 3, retryDelay: 200,
+              });
+            });
+          })(eName);
+        } catch (rmErr) {
+          console.warn('[ForceUpdate] rmSync failed for ' + eName + ': ' + (rmErr.message || rmErr));
+          try { rmErr._evolverEntry = eName; } catch (_) {}
+          throw rmErr;
+        }
       }
+      phase = 'copy';
       var newEntries = fs.readdirSync(TMP_TARGET, { withFileTypes: true });
       for (var ni = 0; ni < newEntries.length; ni++) {
-        // Deferred: package.json is the commit marker, written last + atomically
-        // after every other entry has copied successfully (see below).
-        if (newEntries[ni].name === 'package.json') continue;
+        // Deferred: package.json is the commit marker, written last after every
+        // other entry has copied successfully (see below). Keep-list entries are
+        // local state and must not be overwritten by the downloaded release.
+        if (newEntries[ni].name === 'package.json' || _isForceUpdateKeepEntry(newEntries[ni].name)) continue;
         var src = path.join(TMP_TARGET, newEntries[ni].name);
         var dst = path.join(INSTALL_ROOT, newEntries[ni].name);
-        // On Windows, files held open by antivirus or the OS itself raise EPERM/EBUSY.
-        // Retry up to 3 times with a short delay before propagating the error.
-        var copyErr = null;
-        for (var attempt = 0; attempt < 3; attempt++) {
-          try {
-            fs.cpSync(src, dst, { recursive: true });
-            copyErr = null;
-            break;
-          } catch (cpErr) {
-            copyErr = cpErr;
-            var code = cpErr && cpErr.code;
-            if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') break;
-            // Brief busy-wait — execFileSync has already blocked the event loop,
-            // so a synchronous spin is acceptable here.
-            var until = Date.now() + 200;
-            while (Date.now() < until) { /* spin */ }
-          }
-        }
-        if (copyErr) {
+        try {
+          (function (copySrc, copyDst) {
+            _retryFsLockOperation(function () {
+              fs.cpSync(copySrc, copyDst, { recursive: true });
+            });
+          })(src, dst);
+        } catch (copyErr) {
           console.warn('[ForceUpdate] cpSync failed for ' + newEntries[ni].name + ': ' + (copyErr.message || copyErr));
           // Tag the failing entry so _classifyChannel1Error can name it in the
           // copy_failed detail. phase is already 'copy' here.
@@ -405,40 +495,38 @@ function _executeForceUpdateInner(forceUpdate) {
         }
       }
       // Commit marker: every other entry copied successfully, so swap in the
-      // new package.json LAST and atomically. The old package.json was kept in
-      // place above; only this rename makes the new version visible. Net effect:
-      //   - any throw before this point leaves the OLD package.json intact, so
-      //     the install-guard still reads a valid package.json next tick and the
-      //     force-update simply retries (no install_guard_unreadable wedge);
-      //   - the new version becomes "current" only once the tree is fully in
-      //     place, so a partial install never reports as already-satisfied.
-      // tmp + rename in INSTALL_ROOT (same filesystem) is an atomic replace on
-      // POSIX; Windows renameSync throws EPERM over an existing dest, so unlink
-      // first there. Mirrors src/proxy/mailbox/store.js _persistState.
+      // new package.json LAST. POSIX gets an atomic rename-over-existing. Windows
+      // cannot rename over an existing destination, so it first renames the old
+      // package.json to a recoverable same-directory backup; the install guard
+      // restores that backup on the next tick if the process dies mid-commit.
       var pkgSrc = path.join(TMP_TARGET, 'package.json');
       var pkgDst = path.join(INSTALL_ROOT, 'package.json');
       var pkgTmp = pkgDst + '.' + process.pid + '.evolver-tmp';
-      var pkgErr = null;
-      for (var pa = 0; pa < 3; pa++) {
-        try {
+      var pkgBackup = pkgDst + '.' + process.pid + '.evolver-old';
+      try {
+        _retryFsLockOperation(function () {
+          try { fs.rmSync(pkgTmp, { force: true }); } catch (_) {}
           fs.cpSync(pkgSrc, pkgTmp);
           if (process.platform === 'win32') {
-            try { fs.unlinkSync(pkgDst); } catch (ue) { if (ue && ue.code !== 'ENOENT') throw ue; }
+            if (!fs.existsSync(pkgDst)) _recoverPackageCommitMarkerIfMissing(INSTALL_ROOT);
+            try { fs.rmSync(pkgBackup, { force: true }); } catch (_) {}
+            fs.renameSync(pkgDst, pkgBackup);
+            try {
+              fs.renameSync(pkgTmp, pkgDst);
+            } catch (commitErr) {
+              _restorePackageBackup(pkgBackup, pkgDst);
+              throw commitErr;
+            }
+            try { fs.rmSync(pkgBackup, { force: true }); } catch (_) {}
+          } else {
+            fs.renameSync(pkgTmp, pkgDst);
           }
-          fs.renameSync(pkgTmp, pkgDst);
-          pkgErr = null;
-          break;
-        } catch (pErr) {
-          pkgErr = pErr;
-          try { fs.rmSync(pkgTmp, { force: true }); } catch (_) {}
-          var pcode = pErr && pErr.code;
-          if (pcode !== 'EPERM' && pcode !== 'EBUSY' && pcode !== 'EACCES') break;
-          var puntil = Date.now() + 200;
-          while (Date.now() < puntil) { /* spin */ }
-        }
-      }
-      if (pkgErr) {
+        });
+      } catch (pkgErr) {
+        _restorePackageBackup(pkgBackup, pkgDst);
+        try { fs.rmSync(pkgTmp, { force: true }); } catch (_) {}
         console.warn('[ForceUpdate] package.json commit (atomic replace) failed: ' + (pkgErr.message || pkgErr));
+        try { pkgErr._evolverEntry = 'package.json commit'; } catch (_) {}
         throw pkgErr;
       }
       try { fs.rmSync(TMP_TARGET, { recursive: true, force: true }); } catch (_) {}

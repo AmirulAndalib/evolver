@@ -129,8 +129,19 @@ describe('runPreflightChecks', () => {
     // Force load max high so test machine never triggers load backoff
     const origLoad = process.env.EVOLVE_LOAD_MAX;
     const origQueue = process.env.EVOLVE_AGENT_QUEUE_MAX;
+    const origReleaseWindow = process.env.EVOLVE_RELEASE_WINDOW_MS;
     process.env.EVOLVE_LOAD_MAX = '9999';
     process.env.EVOLVE_AGENT_QUEUE_MAX = '9999';
+    // Disable the release-window guard. runPreflightChecks yields the cycle
+    // when the HEAD commit subject matches /^chore\(release\)/ within
+    // EVOLVE_RELEASE_WINDOW_MS (default 5min). On the post-release-bump CI run
+    // the checked-out HEAD IS that commit (e.g. "chore(release): prepare
+    // v1.89.3"), so without this the test reads its own repo's release commit
+    // and returns abort:true. Setting the window to 0 disables the guard
+    // (windowMs === 0 short-circuit), same neutralization style as LOAD_MAX
+    // above. This is why the test passed on ordinary commits but failed the
+    // required Ubuntu job on every release commit.
+    process.env.EVOLVE_RELEASE_WINDOW_MS = '0';
     // PR #46 added a .evolver.lock cooperative-yield gate. If the developer
     // running tests has the lock present locally, this test would falsely
     // report abort=true. Ensure no lock is present for this assertion.
@@ -151,6 +162,8 @@ describe('runPreflightChecks', () => {
       else process.env.EVOLVE_LOAD_MAX = origLoad;
       if (origQueue === undefined) delete process.env.EVOLVE_AGENT_QUEUE_MAX;
       else process.env.EVOLVE_AGENT_QUEUE_MAX = origQueue;
+      if (origReleaseWindow === undefined) delete process.env.EVOLVE_RELEASE_WINDOW_MS;
+      else process.env.EVOLVE_RELEASE_WINDOW_MS = origReleaseWindow;
     }
   });
 
