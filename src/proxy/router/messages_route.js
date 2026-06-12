@@ -296,6 +296,9 @@ function buildMessagesHandler({ anthropicProxy, logger, routerEnabled, traceStor
 
     const recordStreamTrace = (result) => {
       trace?.recordStreamStart({ status: result.status, upstreamMode, model: chosenModel, headers: result.headers });
+      // Tee the SSE body so the trace captures end-of-stream usage/finish/response-id. Bytes forward unchanged;
+      // observeStream emits the deferred row once the stream ends/cancels/errors.
+      if (trace && result.stream) result.stream = trace.observeStream(result.stream);
       return result;
     };
 
@@ -424,7 +427,7 @@ function buildMessagesHandler({ anthropicProxy, logger, routerEnabled, traceStor
       });
       return {
         status: finalUpstream.status,
-        stream: finalUpstream.stream,
+        stream: trace ? trace.observeStream(finalUpstream.stream) : finalUpstream.stream,
         headers: forwardHeaders,
       };
     }

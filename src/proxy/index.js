@@ -5,6 +5,7 @@ const { MailboxStore } = require('./mailbox/store');
 const { ProxyHttpServer } = require('./server/http');
 const { buildRoutes } = require('./server/routes');
 const { buildMessagesHandler, canonicalizeForBedrock, supportsAdaptiveThinking } = require('./router/messages_route');
+const { ensureEnvelope } = require('./envelope');
 const { buildResponsesHandler } = require('./router/responses_route');
 const { SyncEngine } = require('./sync/engine');
 const { LifecycleManager } = require('./lifecycle/manager');
@@ -204,14 +205,19 @@ class EvoMapProxy {
     });
 
     const proxyHandlers = {
-      assetFetch: (body) => this._proxyHttp('/a2a/fetch', body),
+      // /a2a/fetch and /a2a/validate are strict GEP-A2A protocol endpoints:
+      // the hub runs isValidProtocolMessage and rejects bare bodies
+      // ({asset_ids: [...]}) with 400 invalid_protocol_message, so wrap them
+      // in an envelope first. The GET search endpoints below are lenient REST
+      // and take plain query params -- no envelope there.
+      assetFetch: (body) => this._proxyHttp('/a2a/fetch', this._wrapA2a('fetch', body)),
       // GET (not POST). planAssetSearch() picks signal-search vs semantic-search
       // by whether the body carries a free-text `query` or a `signals` list.
       assetSearch: (body) => {
         const plan = planAssetSearch(body);
         return this._proxyHttp(plan.path, null, { method: 'GET', query: plan.query });
       },
-      assetValidate: (body) => this._proxyHttp('/a2a/validate', body),
+      assetValidate: (body) => this._proxyHttp('/a2a/validate', this._wrapA2a('validate', body)),
       // ATP passthrough (#460 Bug 2): merchant/consumer flows that used to call
       // hub directly via src/atp/hubClient.js must route through the proxy when
       // EVOMAP_PROXY=1 so proxy sees the transaction (for audit + offline queue).
@@ -398,6 +404,13 @@ class EvoMapProxy {
 
   get mailbox() {
     return this.store;
+  }
+
+  // Wrap a bare body in a GEP-A2A envelope (pass-through if already one),
+  // signing it with this proxy's node_id as sender_id so callers cannot
+  // impersonate another node through the proxy.
+  _wrapA2a(messageType, body) {
+    return ensureEnvelope(messageType, body, this.store.getState('node_id'));
   }
 
   async _proxyHttp(path, body, opts = {}) {

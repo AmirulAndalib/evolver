@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { PROXY_PROTOCOL_VERSION } = require('../mailbox/store');
+const { buildEnvelope } = require('../envelope');
 const crypto = require('crypto');
 const { hubFetch } = require('../../gep/hubFetch');
 const { getEvomapPath } = require('../../gep/paths');
@@ -527,13 +528,7 @@ class LifecycleManager {
     const fp = _getEnvFingerprint();
 
     const body = {
-      protocol: 'gep-a2a',
-      protocol_version: '1.0.0',
-      message_type: 'hello',
-      message_id: 'msg_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex'),
-      sender_id: nodeId,
-      timestamp: new Date().toISOString(),
-      payload,
+      ...buildEnvelope('hello', payload, nodeId),
       env_fingerprint: fp,
     };
 

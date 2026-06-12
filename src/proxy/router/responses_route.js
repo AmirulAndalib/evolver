@@ -118,7 +118,9 @@ function buildResponsesHandler({ openAIProxy, logger, traceStore, onTraceQueued 
       });
       return {
         status: upstream.status,
-        stream: upstream.stream,
+        // Tee the codex SSE body so the deferred trace captures usage + response.id from response.completed.
+        // Bytes forward unchanged; emits once on stream end/cancel/error.
+        stream: trace ? trace.observeStream(upstream.stream) : upstream.stream,
         headers: forwardHeaders,
       };
     }
