@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { mergeJsonFile, copyHookScripts, appendSectionToFile, removeHookScripts, removeMarkedSection, assertSafeConfigDir } = require('./hookAdapter');
+const { mergeJsonFile, copyHookScripts, appendSectionToFile, removeHookScripts, removeMarkedSection, assertSafeConfigDir, isEvolverHookCommand } = require('./hookAdapter');
 
 const HOOK_SCRIPTS_DIR_NAME = 'hooks';
 const EVOLVER_MARKER = '<!-- evolver-evolution-memory -->';
@@ -146,7 +146,7 @@ function uninstall({ configRoot }) {
                 const innerBefore = matcher.hooks.length;
                 const filtered = matcher.hooks.filter(h => {
                   const cmd = (h && h.command) || '';
-                  return !cmd.includes('evolver-session') && !cmd.includes('evolver-signal') && !cmd.includes('evolver-task-recall');
+                  return !isEvolverHookCommand(cmd);
                 });
                 // A matcher containing both evolver and user hooks shrinks
                 // its inner array without changing the outer matcher count.

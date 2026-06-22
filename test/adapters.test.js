@@ -259,6 +259,9 @@ describe('hookAdapter', () => {
           Stop: [
             { hooks: [{ type: 'command', command: 'node OLD/evolver-session-end.js' }] },
           ],
+          SessionStart: [
+            { hooks: [{ type: 'command', command: 'bash OLD/evolver-daemon-start.sh' }] },
+          ],
         },
       };
       const newPatch = {
@@ -266,13 +269,20 @@ describe('hookAdapter', () => {
           Stop: [
             { hooks: [{ type: 'command', command: 'node NEW/evolver-session-end.js' }] },
           ],
+          SessionStart: [
+            { hooks: [{ type: 'command', command: 'node NEW/evolver-session-start.js' }] },
+          ],
         },
       };
       const merged = hookAdapter.mergeWithHooksUnion(previousInstall, newPatch);
       assert.equal(merged.hooks.Stop.length, 1, 'evolver entry must be refreshed, not duplicated');
+      assert.equal(merged.hooks.SessionStart.length, 1, 'legacy daemon hook must be refreshed, not preserved');
       const cmds = merged.hooks.Stop.flatMap(m => (m.hooks || []).map(h => h.command));
       assert.ok(cmds[0].includes('NEW/'));
       assert.ok(!cmds.some(c => c.includes('OLD/')));
+      const sessionCmds = merged.hooks.SessionStart.flatMap(m => (m.hooks || []).map(h => h.command));
+      assert.ok(sessionCmds[0].includes('evolver-session-start'));
+      assert.ok(!sessionCmds.some(c => c.includes('evolver-daemon-start')));
     });
 
     it('handles flat (Codex) command shape', () => {

@@ -76,7 +76,7 @@ function mergeWithHooksUnion(target, source) {
       if (tArr && sArr) {
         const isEvolverOwned = (entry) => {
           const cmds = collectCommands(entry);
-          return cmds.some(c => c.includes('evolver-session') || c.includes('evolver-signal') || c.includes('evolver-task-recall'));
+          return cmds.some(isEvolverHookCommand);
         };
         const userEntries = tArr.filter(e => !isEvolverOwned(e));
         result.hooks[event] = [...userEntries, ...sArr];
@@ -99,6 +99,17 @@ function collectCommands(entry) {
     }
   }
   return out;
+}
+
+function isEvolverHookCommand(command) {
+  if (typeof command !== 'string') return false;
+  return command.includes('evolver-session') ||
+    command.includes('evolver-signal') ||
+    command.includes('evolver-task-recall') ||
+    // Legacy installs briefly shipped this companion daemon hook. Treat it
+    // as evolver-owned so reinstall/merge can remove it instead of preserving
+    // a stale supervisor that may point clients at a dead proxy.
+    command.includes('evolver-daemon-start');
 }
 
 function deepMerge(target, source) {
@@ -226,7 +237,7 @@ function removeEvolverHooks(filePath, { markerKey = '_evolver_managed' } = {}) {
           const before = data.hooks[event].length;
           data.hooks[event] = data.hooks[event].filter(h => {
             const cmd = h.command || '';
-            return !cmd.includes('evolver-session') && !cmd.includes('evolver-signal') && !cmd.includes('evolver-task-recall');
+            return !isEvolverHookCommand(cmd);
           });
           if (data.hooks[event].length !== before) changed = true;
           if (data.hooks[event].length === 0) delete data.hooks[event];
@@ -358,6 +369,7 @@ module.exports = {
   deepMerge,
   mergeWithHooksUnion,
   collectCommands,
+  isEvolverHookCommand,
   copyHookScripts,
   appendSectionToFile,
   assertSafeConfigDir,

@@ -10,6 +10,7 @@ const { captureEnvFingerprint } = require('./envFingerprint');
 const { redactString } = require('./sanitize');
 const { getNodeId } = require('./a2aProtocol');
 const { SELF_PR_REPO } = require('../config');
+const { HOST_PROVIDER_ERR_RE } = require('./hostErrorClassifier');
 
 const STATE_FILE_NAME = 'issue_reporter_state.json';
 const DEFAULT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
@@ -29,10 +30,10 @@ const MAX_EVENTS = 5;
 
 // "[NO SESSION LOGS FOUND]" et al. -- the host gave evolver nothing to evolve.
 const HOST_NO_TRANSCRIPT_RE = /\[no session logs? found\]|no session log|no transcript/i;
-// Host LLM-provider errors. None of these strings are emitted by evolver core
-// (verified: no "LLM ERROR" / "MaxTokens" in src/), so their presence means the
-// host Agent's provider call failed -- not an evolver fault.
-const HOST_PROVIDER_ERR_RE = /\bLLM ERROR\b|\bMaxTokens\b|field MaxTokens|max_tokens[^\n]{0,24}invalid|insufficient_quota|invalid_api_key|\brate limit(?:ed| exceeded)?\b|quota exceeded|context length exceeded|maximum context length/i;
+// Host LLM-provider errors (4xx-class). Classified by the shared
+// hostErrorClassifier module (HOST_PROVIDER_ERR_RE imported above) so that
+// issueReporter (suppress *filing*) and signals.js (suppress *ban/streak*,
+// #571) stay in lockstep and cannot drift.
 // Buckets we are confident are host-side; everything else gets filed.
 const SUPPRESS_BUCKETS = new Set(['host_no_transcript', 'host_provider_error', 'local_gene_no_blast']);
 

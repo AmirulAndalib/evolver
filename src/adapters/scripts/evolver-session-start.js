@@ -14,6 +14,180 @@ const { filterRelevantOutcomes } = require('./_memoryFiltering');
 // _maybeRestartDaemon's catch-all and silently disable daemon auto-restart.
 const lockPaths = require('./_lockPaths');
 
+function _readJson(file) {
+  try {
+    if (!file || !fs.existsSync(file)) return null;
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (_) {
+    return null;
+  }
+}
+
+function _isLoopbackProxyUrl(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return false;
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    return u.protocol === 'http:' && (host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]');
+  } catch (_) {
+    return false;
+  }
+}
+
+function _stripTomlComment(line) {
+  let out = '';
+  let quote = null;
+  let escaped = false;
+  for (const ch of String(line || '')) {
+    if (escaped) {
+      out += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\' && quote === '"') {
+      out += ch;
+      escaped = true;
+      continue;
+    }
+    if ((ch === '"' || ch === "'") && !quote) {
+      quote = ch;
+      out += ch;
+      continue;
+    }
+    if (ch === quote) {
+      quote = null;
+      out += ch;
+      continue;
+    }
+    if (ch === '#' && !quote) break;
+    out += ch;
+  }
+  return out.trim();
+}
+
+function _tomlStringValue(value) {
+  const raw = _stripTomlComment(value);
+  const match = raw.match(/^(['"])([\s\S]*)\1$/);
+  return match ? match[2] : raw.trim();
+}
+
+function _codexConfigPath() {
+  if (process.env.CODEX_CONFIG_FILE || process.env.EVOMAP_CODEX_CONFIG_FILE) {
+    return process.env.CODEX_CONFIG_FILE || process.env.EVOMAP_CODEX_CONFIG_FILE;
+  }
+  const home = process.env.HOME || os.homedir();
+  return home ? path.join(home, '.codex', 'config.toml') : null;
+}
+
+function _codexConfigExpectsProxy() {
+  const file = _codexConfigPath();
+  if (!file || !fs.existsSync(file)) return false;
+  let selectedProvider = null;
+  let section = '';
+  const providerUrls = {};
+  try {
+    const content = fs.readFileSync(file, 'utf8');
+    for (const line of content.split(/\r?\n/)) {
+      const clean = _stripTomlComment(line);
+      if (!clean) continue;
+      const sectionMatch = clean.match(/^\[([^\]]+)\]$/);
+      if (sectionMatch) {
+        section = sectionMatch[1].trim();
+        continue;
+      }
+      const kv = clean.match(/^([A-Za-z0-9_.-]+)\s*=\s*([\s\S]+)$/);
+      if (!kv) continue;
+      const key = kv[1].trim();
+      const value = _tomlStringValue(kv[2]);
+      if (!section && key === 'model_provider') {
+        selectedProvider = value;
+        continue;
+      }
+      const providerMatch = section.match(/^model_providers\.([A-Za-z0-9_.-]+)$/);
+      if (providerMatch && key === 'base_url') {
+        providerUrls[providerMatch[1]] = value;
+        continue;
+      }
+      if (!section && key === 'base_url' && _isLoopbackProxyUrl(value)) return true;
+    }
+  } catch {
+    return false;
+  }
+  if (selectedProvider && _isLoopbackProxyUrl(providerUrls[selectedProvider])) return true;
+  return Object.keys(providerUrls).some(name =>
+    /(?:evomap|proxy)/i.test(name) && _isLoopbackProxyUrl(providerUrls[name])
+  );
+}
+
+function _proxyExpected() {
+  if (String(process.env.EVOMAP_PROXY || '').trim() === '1') return true;
+  if (String(process.env.A2A_TRANSPORT || '').trim().toLowerCase() === 'mailbox') return true;
+  if (_isLoopbackProxyUrl(process.env.EVOMAP_PROXY_URL) || _isLoopbackProxyUrl(process.env.ANTHROPIC_BASE_URL)) return true;
+  if (_codexConfigExpectsProxy()) return true;
+
+  const home = process.env.HOME || os.homedir();
+  const settingsFile = process.env.CLAUDE_SETTINGS_FILE || process.env.EVOMAP_CLAUDE_SETTINGS_FILE ||
+    (home ? path.join(home, '.claude', 'settings.json') : null);
+  const settings = _readJson(settingsFile);
+  const cfg = settings && settings.env;
+  return !!(cfg && (
+    _isLoopbackProxyUrl(cfg.EVOMAP_PROXY_URL) ||
+    (String(cfg.EVOMAP_PROXY_AUTO_INJECTED || '') === '1' && _isLoopbackProxyUrl(cfg.ANTHROPIC_BASE_URL))
+  ));
+}
+
+function _proxyReachable(url, token) {
+  if (!_isLoopbackProxyUrl(url) || !token) return false;
+  try {
+    const { execFileSync } = require('child_process');
+    execFileSync(process.execPath, ['-e', `
+const fs = require('fs');
+const http = require('http');
+const url = process.argv[1].replace(/\\/+$/, '') + '/proxy/status';
+const token = fs.readFileSync(0, 'utf8').trim();
+if (!token) process.exit(1);
+const req = http.get(url, { headers: { Authorization: 'Bearer ' + token } }, (res) => {
+  let body = '';
+  res.setEncoding('utf8');
+  res.on('data', (chunk) => {
+    body += chunk;
+    if (body.length > 1024 * 1024) req.destroy(new Error('response too large'));
+  });
+  res.on('end', () => {
+    if (res.statusCode < 200 || res.statusCode >= 300) process.exit(1);
+    let parsed;
+    try { parsed = JSON.parse(body); } catch (_) { process.exit(1); }
+    if (parsed && parsed.status === 'running' && (parsed.proxy_protocol_version || parsed.schema_version || parsed.node_id != null)) {
+      process.exit(0);
+    }
+    process.exit(1);
+  });
+});
+req.setTimeout(700, () => req.destroy(new Error('timeout')));
+req.on('error', () => process.exit(1));
+`, url], { input: String(token), stdio: ['pipe', 'ignore', 'ignore'], timeout: 1200, windowsHide: true });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function _proxyHealthyIfExpected() {
+  if (!_proxyExpected()) return true;
+  const dir = process.env.EVOLVER_SETTINGS_DIR || path.join(os.homedir(), '.evolver');
+  const settings = _readJson(path.join(dir, 'settings.json'));
+  const proxy = settings && settings.proxy;
+  if (!proxy || !proxy.url) return false;
+  if (proxy.pid) {
+    try { process.kill(proxy.pid, 0); } catch (e) {
+      if (!(e && e.code === 'EPERM')) return false;
+    }
+  }
+  if (!proxy.token) return false;
+  return _proxyReachable(proxy.url, proxy.token);
+}
+
 // Auto-restart guard: if the evolver daemon is not running when a new agent
 // session starts, attempt a background restart. This covers the "idle-death"
 // scenario: the user closed the machine (macOS sleep), the process died due to
@@ -69,7 +243,7 @@ function _maybeRestartDaemon(evolverRoot) {
       }
     } catch (_) { /* lock file unreadable or absent: assume not running */ }
 
-    if (daemonRunning) return; // already alive, nothing to do
+    if (daemonRunning && _proxyHealthyIfExpected()) return; // already alive, nothing to do
 
     // Daemon appears dead. Spawn lifecycle.js start in the background so
     // this session-start script exits immediately (< 50 ms) and does not
@@ -305,5 +479,11 @@ function main() {
 if (require.main === module) {
   main();
 } else {
-  module.exports = { belongsToWorkspace };
+  module.exports = {
+    belongsToWorkspace,
+    _isLoopbackProxyUrl,
+    _proxyExpected,
+    _proxyReachable,
+    _proxyHealthyIfExpected,
+  };
 }
