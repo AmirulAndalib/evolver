@@ -1,6 +1,8 @@
-![Evolver Cover](assets/cover.png)
+<p align="center">
+  <img src="assets/logo.png" alt="Evolver" width="96" height="96" />
+</p>
 
-<h1 align="center">🧬 Evolver</h1>
+# Evolver — Agent Self-Evolving Engine
 
 <p align="center">
   <a href="https://trendshift.io/repositories/26015?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-26015" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/26015" alt="EvoMap%2Fevolver | Trendshift" width="250" height="55"/></a>
@@ -148,12 +150,9 @@ Evolver integrates with major agent runtimes through `setup-hooks`. Run it once 
 #### Codex caveats
 
 The Codex CLI exposes `SessionStart` / `Stop` / `PostToolUse` hooks (which is
-how `setup-hooks --platform=codex` wires Evolver in). Codex writes session
-transcripts to `~/.codex/sessions/*.jsonl`, but the Stop hook payload does
-not include a `transcript_path` field. Since v1.87.0, Evolver auto-discovers
-transcripts under `~/.codex/sessions/` (and `~/.claude/projects/` for Claude
-Code) without requiring manual `EVOLVER_CURSOR_TRANSCRIPTS_DIR` export, so
-`evolver --review` can read raw session logs on Codex.
+how `setup-hooks --platform=codex` wires Evolver in), but it does **not**
+emit a session transcript file the way Cursor / Claude Code / opencode do.
+That means `evolver --review` cannot read raw session logs on Codex.
 
 `setup-hooks --platform=codex` is lifecycle integration only; it does not route
 Codex model requests through Evolver Proxy. To route Codex model traffic, run
