@@ -2,7 +2,7 @@
   <img src="assets/logo.png" alt="Evolver" width="96" height="96" />
 </p>
 
-# Evolver — Agent Self-Evolving Engine
+<h1 align="center">Evolver — Agent Self-Evolving Engine</h1>
 
 <p align="center">
   <a href="https://trendshift.io/repositories/26015?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-26015" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/26015" alt="EvoMap%2Fevolver | Trendshift" width="250" height="55"/></a>
