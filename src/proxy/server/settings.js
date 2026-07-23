@@ -12,10 +12,16 @@ const os = require('os');
 // Lazy resolution lets a test set EVOLVER_SETTINGS_DIR to a temp dir before
 // calling start()/readSettings() and stay isolated from concurrent workers.
 function getSettingsDir() {
+  if (process.env.EVOLVER_PROXY_SETTINGS_FILE) {
+    return path.dirname(process.env.EVOLVER_PROXY_SETTINGS_FILE);
+  }
   return process.env.EVOLVER_SETTINGS_DIR || path.join(os.homedir(), '.evolver');
 }
 
 function getSettingsFile() {
+  if (process.env.EVOLVER_PROXY_SETTINGS_FILE) {
+    return process.env.EVOLVER_PROXY_SETTINGS_FILE;
+  }
   return path.join(getSettingsDir(), 'settings.json');
 }
 

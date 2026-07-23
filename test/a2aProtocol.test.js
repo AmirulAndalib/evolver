@@ -737,6 +737,43 @@ describe('node_secret_version hello compatibility', () => {
     assert.deepEqual(tuple, { nodeId: nodeB, secret: secretB, version: 9 });
   });
 
+  it('retries read-only identity tuple when the second canonical read loses a file', () => {
+    const nodeIdFile = path.join(process.env.EVOLVER_HOME, 'node_id');
+    const secretFile = path.join(process.env.EVOLVER_HOME, 'node_secret');
+    const versionFile = path.join(process.env.EVOLVER_HOME, 'node_secret_version');
+    delete process.env.A2A_NODE_ID;
+    _resetCachedNodeIdForTesting();
+    _resetHubNodeSecretStateForTesting();
+
+    const originalReadFileSync = fs.readFileSync;
+    let secretReads = 0;
+    fs.readFileSync = function (file) {
+      if (file === secretFile && arguments[1] === 'utf8') {
+        secretReads += 1;
+        if (secretReads === 2) {
+          fs.rmSync(secretFile, { force: true });
+          fs.writeFileSync(secretFile, 'b'.repeat(64));
+          fs.writeFileSync(versionFile, '9');
+          const err = new Error('transient unlink');
+          err.code = 'ENOENT';
+          throw err;
+        }
+      }
+      return originalReadFileSync.apply(this, arguments);
+    };
+
+    let tuple;
+    try {
+      tuple = getHubIdentityTupleReadOnly();
+    } finally {
+      fs.readFileSync = originalReadFileSync;
+    }
+
+    assert.equal(fs.readFileSync(nodeIdFile, 'utf8'), 'node_aaaaaaaaaaaa');
+    assert.deepEqual(tuple, { nodeId: 'node_aaaaaaaaaaaa', secret: 'b'.repeat(64), version: 9 });
+    assert.ok(secretReads >= 4, 'second-read failure should be retried to a stable snapshot');
+  });
+
   it('clears persisted node_secret_version when hello succeeds without a version', async () => {
     global.fetch = async () => ({
       ok: true,
@@ -1698,6 +1735,7 @@ describe('node_secret_version hello compatibility', () => {
             ? fs.readFileSync(path.join(process.env.EVOLVER_HOME, 'node_secret_env_suppressed'), 'utf8')
             : ''
         }));
+        process.exit(0);
       }).catch((err) => {
         process.stderr.write(String(err && err.stack || err));
         process.exit(1);

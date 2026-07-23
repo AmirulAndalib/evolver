@@ -349,7 +349,10 @@ describe('round-3: SSE reconnect backoff resets on long-sleep wake', () => {
 });
 
 describe('SSE reconnect jitter', () => {
-  const { _computeSseReconnectDelayMsForTesting } = a2a._testing;
+  const {
+    _computeSseReconnectDelayMsForTesting,
+    _computeSseRetryAfterDelayMsForTesting,
+  } = a2a._testing;
 
   it('spreads a 10s backoff uniformly across the 5-15s window', () => {
     assert.equal(_computeSseReconnectDelayMsForTesting(10_000, 0), 5_000);
@@ -367,6 +370,12 @@ describe('SSE reconnect jitter', () => {
     assert.equal(_computeSseReconnectDelayMsForTesting(0, 0), 2_500);
     assert.equal(_computeSseReconnectDelayMsForTesting(10_000, -1), 5_000);
     assert.equal(_computeSseReconnectDelayMsForTesting(10_000, 2), 15_000);
+  });
+
+  it('adds positive jitter to Retry-After without reconnecting early', () => {
+    assert.equal(_computeSseRetryAfterDelayMsForTesting(45_000, 0), 45_000);
+    assert.equal(_computeSseRetryAfterDelayMsForTesting(45_000, 1), 58_500);
+    assert.equal(_computeSseRetryAfterDelayMsForTesting(120_000, 1), 120_000);
   });
 });
 
@@ -446,6 +455,63 @@ describe('issue 594: short-lived SSE streams do not reset reconnect backoff', ()
     }
   });
 
+  it('honors Retry-After on 429 SSE errors before exponential backoff', () => {
+    const savedHubUrl = process.env.A2A_HUB_URL;
+    const savedNodeId = process.env.A2A_NODE_ID;
+    const savedModuleLoad = Module._load;
+    const savedSetTimeout = global.setTimeout;
+    const savedClearTimeout = global.clearTimeout;
+    const savedRandom = Math.random;
+    const savedLog = console.log;
+    const savedWarn = console.warn;
+    const instances = [];
+    const reconnectDelays = [];
+
+    process.env.A2A_HUB_URL = 'http://localhost:19999';
+    process.env.A2A_NODE_ID = 'node_issue606';
+    Module._load = function (request, parent, isMain) {
+      if (request === 'eventsource') {
+        return { EventSource: function () {
+          instances.push(this);
+          this.close = function () {};
+        } };
+      }
+      return savedModuleLoad.call(this, request, parent, isMain);
+    };
+    global.setTimeout = function (_fn, ms) {
+      reconnectDelays.push(ms);
+      return { unref: function () {} };
+    };
+    global.clearTimeout = function () {};
+    Math.random = function () { return 0; };
+    console.log = function () {};
+    console.warn = function () {};
+
+    try {
+      a2a.startEventStream();
+      instances[0].onopen();
+      instances[0].onerror({ code: 429, retryAfter: '45' });
+      assert.deepEqual(reconnectDelays, [45000],
+        'Retry-After must be used as the reconnect floor instead of the 2.5-7.5s exponential window');
+      assert.equal(_getHeartbeatInternalsForTesting().sseReconnectMs, 90000,
+        'the next exponential target should grow from the Retry-After floor');
+      assert.equal(_getHeartbeatInternalsForTesting().pendingSseRetryAfterMs, 0,
+        'Retry-After override must be consumed exactly once');
+    } finally {
+      try { a2a.stopEventStream(); } catch (_) {}
+      if (savedHubUrl === undefined) delete process.env.A2A_HUB_URL;
+      else process.env.A2A_HUB_URL = savedHubUrl;
+      if (savedNodeId === undefined) delete process.env.A2A_NODE_ID;
+      else process.env.A2A_NODE_ID = savedNodeId;
+      Module._load = savedModuleLoad;
+      global.setTimeout = savedSetTimeout;
+      global.clearTimeout = savedClearTimeout;
+      Math.random = savedRandom;
+      console.log = savedLog;
+      console.warn = savedWarn;
+    }
+  });
+
   it('resets reconnect backoff after a stable stream errors', () => {
     const savedHubUrl = process.env.A2A_HUB_URL;
     const savedNodeId = process.env.A2A_NODE_ID;
@@ -490,10 +556,10 @@ describe('issue 594: short-lived SSE streams do not reset reconnect backoff', ()
 
       a2a.startEventStream();
       instances[1].onopen();
-      now += 30001;
+      now += 16001;
       instances[1].onerror();
       assert.deepEqual(reconnectDelays, [5000, 5000],
-        'a stream that survives the stable window should schedule the base reconnect delay');
+        'a stream that survives a 16s idle-proxy drop window should schedule the base reconnect delay');
       assert.equal(_getHeartbeatInternalsForTesting().sseReconnectMs, 10000);
     } finally {
       try { a2a.stopEventStream(); } catch (_) {}

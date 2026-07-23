@@ -15,6 +15,27 @@ Short 1-2 sentence summary of the change.
 
 Low / Medium / High -- note if it touches infra or public API.
 
+## Harness/evaluator governance
+
+Required when this PR touches Evolver harness/evaluator/self-evolution surfaces:
+GEP schemas, prompt/selector/mutation/solidify/candidate/evaluator logic,
+evolve pipeline, adapter execution bridge, proxy routing/trace, bundled GEP
+assets, or the EvoX bridge contract. For unrelated PRs, write
+`N/A -- not a harness/evaluator governance change` on each line.
+
+Upstream governance surface: <typed Evolver surface, or N/A>
+Downstream EvoX impact: <bridge/contract/runtime impact, or N/A>
+Rollout-local scope: <proposal/shadow/cohort boundary before promotion, or N/A>
+Promotion boundary: <proposal→rollout→PR/default boundary, or N/A>
+Evaluator mismatch sets: <observation/action/repair/verification/evidence/belief sets covered, or N/A>
+Non-regression evidence: <tests/shadow runs/replay/doc-only rationale, or N/A>
+Fix-severity review: <low | medium | high | critical>
+Owner approval: <owning module/reviewer requirement, or N/A>
+Security boundary: <data/tool/host/network/secrets impact, or N/A>
+Rollback: <disable/revert/quarantine path, or N/A>
+Live promotion: no
+Autonomous evaluator self-editing: no
+
 ## Self-check
 
 Tick only the boxes that apply, but every applicable box must be ticked. Bugbot

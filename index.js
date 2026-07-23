@@ -206,6 +206,19 @@ if (process.argv[2] === 'proxy-token') {
   }
 }
 
+const {
+  applyProxyCliPathOptions,
+  prepareProxyCliEnvironment,
+} = require('./cli-options');
+
+let _proxyCliBootstrap = { options: {}, envFile: { loaded: false, error: null } };
+let _proxyCliBootstrapError = null;
+try {
+  _proxyCliBootstrap = prepareProxyCliEnvironment(process.argv.slice(2), process.env);
+} catch (error) {
+  _proxyCliBootstrapError = error;
+}
+
 // Load .env BEFORE any internal require so that a2aProtocol and ATP
 // modules see A2A_NODE_SECRET / A2A_NODE_ID / A2A_HUB_URL at first
 // access and never fall back to a stale persisted/cached secret.
@@ -242,6 +255,9 @@ try {
   if (_root && _root !== process.cwd()) {
     require('dotenv').config({ path: _path.join(_root, '.env') });
   }
+  // CLI paths have the highest priority, including over values loaded from
+  // either the selected env file or the repository defaults.
+  applyProxyCliPathOptions(_proxyCliBootstrap.options, process.env);
   if (_prevQuiet === undefined) delete process.env.EVOLVER_QUIET_PARENT_GIT;
   else process.env.EVOLVER_QUIET_PARENT_GIT = _prevQuiet;
 } catch (e) { /* dotenv is optional */ }
@@ -831,6 +847,14 @@ function refuseHelloIfDaemonRunning(toolLabel) {
 }
 
 async function main() {
+  if (_proxyCliBootstrapError) {
+    console.error('[evolver] ' + _proxyCliBootstrapError.message);
+    process.exitCode = 1;
+    return;
+  }
+  if (_proxyCliBootstrap.envFile.error) {
+    console.warn('[evolver] Failed to load --env-file: ' + _proxyCliBootstrap.envFile.error.message);
+  }
   const args = process.argv.slice(2);
   const command = args[0];
   // Solo mode (--solo): the "constrained wild" profile. Implies loop (a solo
@@ -1450,6 +1474,7 @@ async function main() {
             const { startProxy } = require('./src/proxy');
             const proxyInfo = await startProxy({
               hubUrl: process.env.A2A_HUB_URL,
+              dataDir: process.env.EVOLVER_PROXY_STORE,
               clientSettings: {},
             });
             console.log('[Proxy] Started on ' + proxyInfo.url);
@@ -3690,6 +3715,11 @@ async function main() {
                                 (read versioned node secrets from a JSON file)
     - --hub-private-key=<path>|--hub-private-key <path>
                                 (decrypt hub_key_envelope trace rows with a local private key)
+  - run path flags (CLI overrides environment variables):
+    - --home=<dir>              (root for assets, mailbox, settings, and traces)
+    - --store=<dir>             (mailbox store directory; EVOLVER_PROXY_STORE)
+    - --settings=<path>         (proxy settings file; EVOLVER_PROXY_SETTINGS_FILE)
+    - --env-file=<path>         (environment file; EVOLVER_ENV_FILE)
   - webui flags:
     - --port=<N>               (local Web UI port, default 19821)
 

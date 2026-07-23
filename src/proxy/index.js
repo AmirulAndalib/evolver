@@ -29,7 +29,9 @@ const HUB_EVENT_RETRY_MAX_MS = 30_000;
 const HUB_EVENT_RETRY_MAX_PENDING = 1_024;
 
 // Lazy via paths.getEvomapPath() — honors EVOLVER_HOME (#114).
-function _defaultDataDir() { return getEvomapPath('mailbox'); }
+function _defaultDataDir() {
+  return process.env.EVOLVER_PROXY_STORE || getEvomapPath('mailbox');
+}
 
 const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1';
 const OPENAI_COMPATIBLE_BASE_URLS = Object.freeze({
